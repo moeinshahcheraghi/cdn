@@ -1,0 +1,14 @@
+{
+  // Public listen address. Use :443 in production to blend with HTTPS.
+  "listen": ":443",
+  // Any client presenting one of these passwords is authenticated.
+  "passwords": ["change-me-to-a-long-random-secret"],
+  // Real certificate for your domain. Leave both empty to auto self-sign
+  // (fine for testing; for real cover use a valid cert for a real domain).
+  "tls_cert": "",
+  "tls_key": "",
+  // A real HTTP origin shown to anyone who fails auth (defeats active probing).
+  // Point this at a local web server or a real site you control.
+  "fallback": "127.0.0.1:80",
+  "log": "info"
+}

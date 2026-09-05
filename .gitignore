@@ -1,0 +1,7 @@
+/bin/
+*.log
+server.json
+client.json
+*.pem
+/server
+/client

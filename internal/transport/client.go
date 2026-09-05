@@ -1,0 +1,82 @@
+package transport
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"time"
+
+	utls "github.com/refraction-networking/utls"
+)
+
+// Dialer establishes browser-looking TLS connections to the tunnel server.
+type Dialer struct {
+	Server        string // host:port of the server
+	SNI           string // ServerName to present
+	Fingerprint   string // browser to mimic
+	AllowInsecure bool   // skip cert verification (self-signed)
+	tcp           net.Dialer
+}
+
+// NewDialer builds a Dialer with sensible TCP timeouts and keepalive.
+func NewDialer(server, sni, fingerprint string, insecure bool) *Dialer {
+	if sni == "" {
+		if host, _, err := net.SplitHostPort(server); err == nil {
+			sni = host
+		}
+	}
+	return &Dialer{
+		Server:        server,
+		SNI:           sni,
+		Fingerprint:   fingerprint,
+		AllowInsecure: insecure,
+		tcp:           net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second},
+	}
+}
+
+// Dial opens a TCP connection and performs a uTLS handshake whose ClientHello
+// matches a real browser, so DPI fingerprinting (JA3/JA4) cannot flag it.
+func (d *Dialer) Dial(ctx context.Context) (net.Conn, error) {
+	raw, err := d.tcp.DialContext(ctx, "tcp", d.Server)
+	if err != nil {
+		return nil, fmt.Errorf("transport: dial %s: %w", d.Server, err)
+	}
+	tcp := raw.(*net.TCPConn)
+	_ = tcp.SetNoDelay(true) // low latency: don't wait to coalesce small writes
+
+	uconn := utls.UClient(raw, &utls.Config{
+		ServerName:         d.SNI,
+		InsecureSkipVerify: d.AllowInsecure,
+		NextProtos:         []string{"h2", "http/1.1"},
+	}, clientHelloID(d.Fingerprint))
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = uconn.SetDeadline(deadline)
+	} else {
+		_ = uconn.SetDeadline(time.Now().Add(10 * time.Second))
+	}
+	if err := uconn.HandshakeContext(ctx); err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("transport: tls handshake: %w", err)
+	}
+	_ = uconn.SetDeadline(time.Time{})
+	return uconn, nil
+}
+
+// clientHelloID maps a name to a uTLS fingerprint, defaulting to auto-Chrome.
+func clientHelloID(name string) utls.ClientHelloID {
+	switch name {
+	case "firefox":
+		return utls.HelloFirefox_Auto
+	case "safari":
+		return utls.HelloSafari_Auto
+	case "ios":
+		return utls.HelloIOS_Auto
+	case "edge":
+		return utls.HelloEdge_Auto
+	case "random":
+		return utls.HelloRandomizedALPN
+	default:
+		return utls.HelloChrome_Auto
+	}
+}

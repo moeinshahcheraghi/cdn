@@ -1,0 +1,14 @@
+[Unit]
+Description=DPI-resistant tunnel client (local proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tunnel-client -c /etc/tunnel/client.json
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

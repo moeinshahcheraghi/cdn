@@ -1,0 +1,17 @@
+{
+  // host:port of your server.
+  "server": "your-domain.example:443",
+  "password": "change-me-to-a-long-random-secret",
+  // SNI to present; must match the server certificate's domain.
+  "sni": "your-domain.example",
+  // Browser TLS fingerprint to mimic: chrome|firefox|safari|ios|edge|random.
+  "fingerprint": "chrome",
+  // Local proxies. Point your browser/system at either.
+  "socks_listen": "127.0.0.1:1080",
+  "http_listen": "127.0.0.1:1081",
+  // Multiplex many streams over few TLS connections for low latency.
+  "mux": { "enabled": true, "concurrency": 8, "pool": 4 },
+  // Set true only with a self-signed server cert.
+  "allow_insecure": false,
+  "log": "info"
+}
