@@ -3,12 +3,23 @@
   "listen": ":443",
   // Any client presenting one of these passwords is authenticated.
   "passwords": ["change-me-to-a-long-random-secret"],
-  // Real certificate for your domain. Leave both empty to auto self-sign
-  // (fine for testing; for real cover use a valid cert for a real domain).
+  // Automatic certificate from Let's Encrypt via the TLS-ALPN-01 challenge on
+  // this same :443 listener. Set "domain" to a hostname that resolves to this
+  // server and leave tls_cert/tls_key empty. This is the recommended setup:
+  // real, trusted certs with no extra web server. Remove this block to use
+  // tls_cert/tls_key or the self-signed fallback instead.
+  "acme": {
+    "domain": "",
+    "email": "",
+    "cache_dir": "/var/lib/tunnel/acme"
+  },
+  // Real certificate for your domain, as an alternative to acme. Leave both
+  // empty (and acme.domain empty) to auto self-sign (testing only; weaker cover).
   "tls_cert": "",
   "tls_key": "",
-  // A real HTTP origin shown to anyone who fails auth (defeats active probing).
-  // Point this at a local web server or a real site you control.
+  // A real HTTP(S) origin shown to anyone who fails auth (defeats active
+  // probing). Point at a local site, or use a real public HTTPS site on :443
+  // (dialed over TLS automatically) so no local web server is needed.
   "fallback": "127.0.0.1:80",
   "log": "info"
 }

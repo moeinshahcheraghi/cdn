@@ -20,6 +20,8 @@ active probing را خنثی می‌کند. محدودیت پهنای‌باند
 | Active probing | Wrong-auth connections are reverse-proxied to a real site |
 | Protocol/entropy analysis | It *is* real TLS 1.3, not an obfuscated stream |
 | Throughput/latency shaping | smux multiplexing, TCP NoDelay, BBR, no rate limit |
+| TLS-in-TLS record-size shape | payload is framed and randomly padded, so the tell-tale handshake/keepalive record sizes are hidden |
+| Long-flow keepalive fingerprint | no application-layer keepalive; liveness is kernel TCP keepalive, and idle sessions are retired |
 
 The wire format follows the Trojan idea: after the TLS handshake, a client sends
 a 56-byte SHA-224 password digest; a peer that does not is indistinguishable from
@@ -35,8 +37,11 @@ make linux-amd64   # or linux-arm64, for cross-compiling to your VPS
 
 ## Server (on your VPS)
 
-1. Point a domain at the VPS and get a real certificate (e.g. with Caddy or
-   certbot). Set `tls_cert`/`tls_key`. Leaving them empty self-signs, which
+1. Point a domain at the VPS. The simplest path is automatic certificates:
+   set `acme.domain` to that hostname and leave `tls_cert`/`tls_key` empty, and
+   the server obtains and renews a real Let's Encrypt certificate over its own
+   :443 (TLS-ALPN-01), no separate web server needed. You can instead supply
+   your own `tls_cert`/`tls_key`. Leaving all of them empty self-signs, which
    works but is weaker cover.
 2. Run a real web server locally (nginx/Caddy on `127.0.0.1:80`) and set
    `fallback` to it, so probes see a real site.
@@ -75,6 +80,11 @@ Key client options: `fingerprint` (chrome/firefox/safari/ios/edge/random),
 
 - Current build tunnels TCP (CONNECT). UDP-associate is not yet implemented, so
   QUIC/HTTP3 and some game/VoIP UDP will fall back to TCP in the browser.
+- `fingerprint: chrome` (the default) is the safest choice. `random` builds a
+  ClientHello no real browser sends and should only be used for experiments.
+- smux is vendored under `third_party/` with one bug fix (see its `PATCH.md`):
+  upstream discards unread received data when a multiplexed stream is
+  half-closed, which truncated transfers. Keep the `replace` directive.
 - For the strongest cover, use a real domain + valid certificate and a real
   fallback website, not the self-signed/testing defaults.
 - Use a long random password. It is the only secret protecting the server.

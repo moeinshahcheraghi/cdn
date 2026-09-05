@@ -17,11 +17,22 @@ type ServerConfig struct {
 	// self-signed cert is generated for SNI (fine for testing, weaker cover).
 	TLSCert string `json:"tls_cert"`
 	TLSKey  string `json:"tls_key"`
+	// ACME obtains and renews a real certificate automatically (Let's Encrypt)
+	// using the TLS-ALPN-01 challenge on this same listener, which therefore
+	// must be reachable on port 443 of Domain. Takes precedence over TLSCert.
+	ACME ACMEConfig `json:"acme"`
 	// Fallback is a real HTTP(S) origin that unauthenticated / probe traffic is
 	// reverse-proxied to, so the server is indistinguishable from a web server.
 	Fallback string `json:"fallback"`
 	// Log level: error|warn|info|debug.
 	Log string `json:"log"`
+}
+
+// ACMEConfig enables automatic certificates.
+type ACMEConfig struct {
+	Domain   string `json:"domain"`    // hostname the certificate is for
+	Email    string `json:"email"`     // optional contact for the CA
+	CacheDir string `json:"cache_dir"` // where certs/keys are persisted
 }
 
 // ClientConfig configures the local proxy that tunnels to the server.
@@ -66,6 +77,14 @@ func LoadServer(path string) (*ServerConfig, error) {
 	}
 	if c.Fallback == "" {
 		c.Fallback = "example.com:443"
+	}
+	if c.ACME.Domain != "" {
+		if c.TLSCert != "" || c.TLSKey != "" {
+			return nil, fmt.Errorf("config: use either acme or tls_cert/tls_key, not both")
+		}
+		if c.ACME.CacheDir == "" {
+			c.ACME.CacheDir = "/var/lib/tunnel/acme"
+		}
 	}
 	if c.Log == "" {
 		c.Log = "info"

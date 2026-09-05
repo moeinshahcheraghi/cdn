@@ -30,7 +30,7 @@ func NewDialer(server, sni, fingerprint string, insecure bool) *Dialer {
 		SNI:           sni,
 		Fingerprint:   fingerprint,
 		AllowInsecure: insecure,
-		tcp:           net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second},
+		tcp:           net.Dialer{Timeout: 10 * time.Second, KeepAliveConfig: KeepAlive},
 	}
 }
 
@@ -64,6 +64,8 @@ func (d *Dialer) Dial(ctx context.Context) (net.Conn, error) {
 }
 
 // clientHelloID maps a name to a uTLS fingerprint, defaulting to auto-Chrome.
+// "random" builds a hello no real browser sends and is the weakest choice
+// against fingerprint whitelisting; it exists only for experiments.
 func clientHelloID(name string) utls.ClientHelloID {
 	switch name {
 	case "firefox":

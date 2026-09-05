@@ -31,6 +31,11 @@ func main() {
 
 	client := tunnel.NewClient(cfg)
 	defer client.Close()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		client.Warm(ctx)
+	}()
 
 	var listeners []net.Listener
 	for _, addr := range dedupe(cfg.SocksListen, cfg.HTTPListen) {

@@ -15,7 +15,8 @@ import (
 // handshakeHTTP handles an HTTP proxy connection. CONNECT is answered with a
 // 200 and then relayed raw; a plain proxied request is rewritten into an
 // origin-form request and replayed as the tunnel's first bytes, so the target
-// web server receives an ordinary HTTP request.
+// web server receives an ordinary HTTP request. Only the head is rewritten;
+// the body stays in the buffered reader and streams through untouched.
 func handshakeHTTP(c net.Conn, br *bufio.Reader) (protocol.Address, net.Conn, error) {
 	req, err := http.ReadRequest(br)
 	if err != nil {
@@ -37,16 +38,33 @@ func handshakeHTTP(c net.Conn, br *bufio.Reader) (protocol.Address, net.Conn, er
 	if err != nil {
 		return protocol.Address{}, nil, err
 	}
-	// Convert absolute-form (proxy) request into origin-form.
-	req.RequestURI = ""
+	uri := "/"
 	if req.URL != nil {
-		req.URL.Scheme = ""
-		req.URL.Host = ""
+		if u := req.URL.RequestURI(); u != "" {
+			uri = u
+		}
 	}
+	// Proxy-* headers are for us, not the origin. Connection: close makes the
+	// origin end the connection after one response, so a browser cannot reuse
+	// this proxy connection for a different host (we relay raw after this).
+	for k := range req.Header {
+		if strings.HasPrefix(strings.ToLower(k), "proxy-") {
+			delete(req.Header, k)
+		}
+	}
+	req.Header.Set("Connection", "close")
+
 	var buf bytes.Buffer
-	if err := req.Write(&buf); err != nil {
+	fmt.Fprintf(&buf, "%s %s HTTP/1.1\r\nHost: %s\r\n", req.Method, uri, req.Host)
+	if err := req.Header.Write(&buf); err != nil {
 		return protocol.Address{}, nil, err
 	}
+	for _, te := range req.TransferEncoding {
+		if te == "chunked" {
+			buf.WriteString("Transfer-Encoding: chunked\r\n")
+		}
+	}
+	buf.WriteString("\r\n")
 	return protocol.NewAddress(host, port), withReadPrefix(c, br, buf.Bytes()), nil
 }
 

@@ -3,18 +3,21 @@
 package tunnel
 
 import (
-	"time"
-
 	"github.com/xtaci/smux"
 )
 
 // smuxConfig is tuned for throughput: large receive/stream buffers keep the
-// pipe full over high-latency links, and keepalives shed dead sessions.
+// pipe full over high-latency links.
+//
+// smux's own keepalive is disabled on purpose. It would emit an 8-byte frame
+// every few seconds in both directions for the life of the session, a
+// metronome no browser produces and an easy long-flow signature for DPI.
+// Liveness comes from kernel TCP keepalive instead (see transport), which is
+// invisible above TCP, and idle sessions are retired by the client pool.
 func smuxConfig() *smux.Config {
 	c := smux.DefaultConfig()
 	c.Version = 2
-	c.KeepAliveInterval = 15 * time.Second
-	c.KeepAliveTimeout = 45 * time.Second
+	c.KeepAliveDisabled = true
 	c.MaxFrameSize = 32 * 1024
 	c.MaxReceiveBuffer = 8 * 1024 * 1024
 	c.MaxStreamBuffer = 2 * 1024 * 1024

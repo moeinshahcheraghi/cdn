@@ -28,11 +28,14 @@ func main() {
 	}
 	logx.SetLevel(cfg.Log)
 
-	sni := ""
-	if h, _, e := net.SplitHostPort(cfg.Listen); e == nil {
-		sni = h
+	sni := cfg.ACME.Domain
+	if sni == "" {
+		if h, _, e := net.SplitHostPort(cfg.Listen); e == nil {
+			sni = h
+		}
 	}
-	tlsCfg, err := transport.NewServerTLSConfig(cfg.TLSCert, cfg.TLSKey, sni)
+	acme := &transport.ACME{Domain: cfg.ACME.Domain, Email: cfg.ACME.Email, CacheDir: cfg.ACME.CacheDir}
+	tlsCfg, err := transport.NewServerTLSConfig(cfg.TLSCert, cfg.TLSKey, sni, acme)
 	if err != nil {
 		logx.Errorf("%v", err)
 		os.Exit(1)
@@ -46,6 +49,9 @@ func main() {
 		os.Exit(1)
 	}
 	logx.Infof("server listening on %s, fallback -> %s", cfg.Listen, cfg.Fallback)
+	if cfg.ACME.Domain != "" {
+		logx.Infof("acme certificate for %s (cache %s)", cfg.ACME.Domain, cfg.ACME.CacheDir)
+	}
 
 	go func() {
 		for {

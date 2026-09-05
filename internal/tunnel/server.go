@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"crypto/tls"
 	"io"
@@ -9,14 +10,18 @@ import (
 
 	"github.com/moeinshah0/tunnel/internal/fallback"
 	"github.com/moeinshah0/tunnel/internal/logx"
+	"github.com/moeinshah0/tunnel/internal/pad"
 	"github.com/moeinshah0/tunnel/internal/protocol"
 	"github.com/moeinshah0/tunnel/internal/relay"
+	"github.com/moeinshah0/tunnel/internal/transport"
 	"github.com/xtaci/smux"
 )
 
-// authTimeout bounds how long the server waits for a client's auth prefix
-// before treating the peer as a probe and handing it to the fallback.
-const authTimeout = 8 * time.Second
+// authTimeout bounds the TLS handshake plus the wait for the client's first
+// record. It is deliberately generous, like a web server's header timeout,
+// so that a slow-but-real client is not misclassified; a probe that sends a
+// complete request is answered immediately regardless (see Handle).
+const authTimeout = 30 * time.Second
 
 // dialTimeout bounds connecting to a requested destination.
 const dialTimeout = 15 * time.Second
@@ -49,35 +54,54 @@ func (s *Server) Handle(raw net.Conn) {
 		conn.Close()
 		return
 	}
+	if conn.ConnectionState().NegotiatedProtocol == transport.ACMEALPN {
+		// A certificate-authority validation connection; the handshake itself
+		// was the whole point.
+		conn.Close()
+		return
+	}
 
-	// Read the fixed-length auth prefix. Everything read is retained so a
-	// failed auth can be replayed verbatim to the fallback origin.
+	// Read the client's first record with a single Read rather than
+	// io.ReadFull: our client always puts the whole header in one record, and
+	// a web browser's request is longer than the digest anyway. A probe that
+	// sends a short but complete request must not be left hanging until the
+	// deadline (a real web server would answer at once), so whatever arrived
+	// is judged immediately and replayed verbatim to the fallback origin.
 	prefix := make([]byte, protocol.HashLen)
-	n, err := io.ReadFull(conn, prefix)
+	n, err := conn.Read(prefix)
 	if err != nil || !s.authorized(prefix[:n]) {
 		_ = conn.SetDeadline(time.Time{})
 		s.fallback.Serve(conn, prefix[:n])
 		return
 	}
 
-	// Consume the CRLF after the digest, then the request metadata.
-	if err := expectCRLF(conn); err != nil {
-		s.fallback.Serve(conn, nil)
+	// Consume the CRLF after the digest, then the request metadata. Keep the
+	// bytes so that even a malformed-but-authenticated request is handed to
+	// the fallback without revealing anything.
+	var seen bytes.Buffer
+	seen.Write(prefix)
+	tee := io.TeeReader(conn, &seen)
+	if err := expectCRLF(tee); err != nil {
+		_ = conn.SetDeadline(time.Time{})
+		s.fallback.Serve(conn, seen.Bytes())
 		return
 	}
-	meta, err := protocol.ReadMetadata(conn)
+	meta, err := protocol.ReadMetadata(tee)
 	if err != nil {
 		logx.Debugf("server: read metadata: %v", err)
-		conn.Close()
+		_ = conn.SetDeadline(time.Time{})
+		s.fallback.Serve(conn, seen.Bytes())
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
 
+	// Everything after the header travels in padded frames.
+	pc := pad.New(conn)
 	switch meta.Command {
 	case protocol.CmdMux:
-		s.serveMux(conn)
+		s.serveMux(pc)
 	case protocol.CmdConnect:
-		s.relayTCP(conn, meta.Address)
+		s.relayTCP(pc, meta.Address)
 	default:
 		logx.Debugf("server: unsupported command 0x%02x", byte(meta.Command))
 		conn.Close()
