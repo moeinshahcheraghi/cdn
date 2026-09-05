@@ -5,14 +5,17 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/moeinshah0/tunnel/internal/config"
 	"github.com/moeinshah0/tunnel/internal/logx"
+	"github.com/moeinshah0/tunnel/internal/protocol"
 	"github.com/moeinshah0/tunnel/internal/relay"
 	"github.com/moeinshah0/tunnel/internal/socks"
 	"github.com/moeinshah0/tunnel/internal/tunnel"
@@ -49,6 +52,22 @@ func main() {
 		go acceptLoop(ln, client)
 	}
 
+	for _, f := range cfg.Forwards {
+		target, err := parseTarget(f.Target)
+		if err != nil {
+			logx.Errorf("forward %s: %v", f.Listen, err)
+			os.Exit(1)
+		}
+		ln, err := net.Listen("tcp", f.Listen)
+		if err != nil {
+			logx.Errorf("listen %s: %v", f.Listen, err)
+			os.Exit(1)
+		}
+		listeners = append(listeners, ln)
+		logx.Infof("port forward %s -> %s (via %s)", f.Listen, f.Target, cfg.Server)
+		go forwardLoop(ln, client, target)
+	}
+
 	waitForSignal()
 	logx.Infof("shutting down")
 	for _, ln := range listeners {
@@ -65,6 +84,46 @@ func acceptLoop(ln net.Listener, client *tunnel.Client) {
 		}
 		go handle(conn, client)
 	}
+}
+
+// forwardLoop tunnels every connection accepted on ln to a fixed target.
+func forwardLoop(ln net.Listener, client *tunnel.Client, target protocol.Address) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				_ = tcp.SetNoDelay(true)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			stream, err := client.OpenStream(ctx, target)
+			cancel()
+			if err != nil {
+				logx.Warnf("client: forward to %s: %v", target, err)
+				conn.Close()
+				return
+			}
+			logx.Debugf("client: forward %s -> %s", conn.RemoteAddr(), target)
+			relay.Pipe(conn, stream)
+			conn.Close()
+			stream.Close()
+		}()
+	}
+}
+
+// parseTarget turns host:port into a tunnel address.
+func parseTarget(hostport string) (protocol.Address, error) {
+	host, portStr, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return protocol.Address{}, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return protocol.Address{}, fmt.Errorf("bad port %q", portStr)
+	}
+	return protocol.NewAddress(host, port), nil
 }
 
 // handle turns one local connection into a tunneled stream.

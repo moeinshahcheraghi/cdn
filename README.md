@@ -69,6 +69,31 @@ Then point your browser or system at the local proxy:
 
 Both ports actually accept *either* protocol (auto-detected).
 
+## Putting OpenVPN (or any TCP service) behind the tunnel
+
+Use the client's `forwards` for a relay setup: users connect to a server inside
+the country, which carries their traffic through the tunnel to the exit server.
+
+```
+user's OpenVPN client --> iran-relay:2083 --> [tunnel] --> exit-server:2083 (OpenVPN)
+```
+
+- On the **exit server**: run `tunnel-server` on :443 and OpenVPN in **TCP**
+  mode (`proto tcp-server`), e.g. on port 2083, bound to localhost is fine.
+- On the **relay server** (inside the country): run `tunnel-client` with
+
+  ```json
+  "forwards": [{ "listen": "0.0.0.0:2083", "target": "127.0.0.1:2083" }]
+  ```
+
+  `target` is resolved on the exit server, so `127.0.0.1` there means the exit
+  server's own OpenVPN. You may leave `socks_listen`/`http_listen` empty.
+- Users point their OpenVPN profile at `iran-relay:2083`, `proto tcp`.
+
+OpenVPN must use TCP: the tunnel carries TCP only, and UDP-associate is not
+implemented. The DPI only ever sees browser-looking HTTPS between the relay
+and the exit server; the OpenVPN protocol never appears on that link.
+
 ## Configuration
 
 See `server.example.json` and `client.example.json`; every field is commented.

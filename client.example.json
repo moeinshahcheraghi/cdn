@@ -9,6 +9,11 @@
   // Local proxies. Point your browser/system at either.
   "socks_listen": "127.0.0.1:1080",
   "http_listen": "127.0.0.1:1081",
+  // Raw TCP port forwards through the tunnel. Anything connecting to "listen"
+  // is delivered to "target" as seen from the server. Example: run this client
+  // on an Iranian relay VPS and forward OpenVPN (TCP mode) to the exit server:
+  //   "forwards": [{ "listen": "0.0.0.0:2083", "target": "127.0.0.1:1194" }]
+  "forwards": [],
   // Multiplex many streams over few TLS connections for low latency.
   "mux": { "enabled": true, "concurrency": 8, "pool": 4 },
   // Set true only with a self-signed server cert.

@@ -4,6 +4,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 )
 
@@ -48,12 +49,23 @@ type ClientConfig struct {
 	// SocksListen / HTTPListen are local proxy addresses (either may be empty).
 	SocksListen string `json:"socks_listen"`
 	HTTPListen  string `json:"http_listen"`
+	// Forwards are raw TCP port forwards: anything connecting to Listen is
+	// tunneled to Target, which is resolved on the server side. This is how
+	// you put a whole service (OpenVPN in TCP mode, SSH, a game server) behind
+	// the tunnel without the application knowing about a proxy.
+	Forwards []Forward `json:"forwards"`
 	// Mux multiplexes many streams over few TLS connections for low latency.
 	Mux MuxConfig `json:"mux"`
 	// AllowInsecure skips certificate verification (needed for self-signed).
 	AllowInsecure bool `json:"allow_insecure"`
 	// Log level: error|warn|info|debug.
 	Log string `json:"log"`
+}
+
+// Forward is one raw TCP port forward through the tunnel.
+type Forward struct {
+	Listen string `json:"listen"` // local address to accept on, e.g. "0.0.0.0:2083"
+	Target string `json:"target"` // host:port as seen from the server, e.g. "127.0.0.1:1194"
 }
 
 // MuxConfig tunes stream multiplexing.
@@ -107,8 +119,16 @@ func LoadClient(path string) (*ClientConfig, error) {
 	if c.Fingerprint == "" {
 		c.Fingerprint = "chrome"
 	}
-	if c.SocksListen == "" && c.HTTPListen == "" {
+	if c.SocksListen == "" && c.HTTPListen == "" && len(c.Forwards) == 0 {
 		c.SocksListen = "127.0.0.1:1080"
+	}
+	for i, f := range c.Forwards {
+		if f.Listen == "" || f.Target == "" {
+			return nil, fmt.Errorf("config: forwards[%d]: listen and target are required", i)
+		}
+		if _, _, err := net.SplitHostPort(f.Target); err != nil {
+			return nil, fmt.Errorf("config: forwards[%d]: target must be host:port: %w", i, err)
+		}
 	}
 	if c.Mux.Enabled {
 		if c.Mux.Concurrency <= 0 {
