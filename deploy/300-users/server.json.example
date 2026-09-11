@@ -1,0 +1,25 @@
+{
+  // EXIT server (abroad). Public IP 91.107.159.20, domain game.xirix.li.
+  // Runs on :443 to blend with normal HTTPS.
+  "listen": ":443",
+
+  // Shared secret(s). Every OpenVPN user's traffic rides the ONE tunnel the
+  // Iran relay opens, so a single strong password here is enough. Change it and
+  // keep it byte-identical to the client's "password".
+  "passwords": ["CHANGE_ME_TO_A_LONG_RANDOM_SECRET"],
+
+  // Real Let's Encrypt cert for game.xirix.li via TLS-ALPN-01 on this same :443.
+  // game.xirix.li must resolve to this server (A record -> 91.107.159.20).
+  "acme": {
+    "domain": "game.xirix.li",
+    "email": "moeinshah0@gmail.com",
+    "cache_dir": "/var/lib/tunnel/acme"
+  },
+
+  // Anyone who fails auth (a censor's active probe) is transparently proxied
+  // here, so the port looks like a plain HTTPS site. Must be a clean host:port
+  // (no markdown/URL brackets!).
+  "fallback": "www.wikipedia.org:443",
+
+  "log": "info"
+}

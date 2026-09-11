@@ -1,0 +1,33 @@
+{
+  // IRAN relay VPS (public IP 193.176.243.31). All OpenVPN users connect to
+  // this box; it multiplexes them through ONE DPI-resistant tunnel to the exit.
+  "server": "game.xirix.li:443",
+
+  // Must exactly match a server password.
+  "password": "CHANGE_ME_TO_A_LONG_RANDOM_SECRET",
+
+  // SNI MUST equal the ACME domain — autocert only serves a cert for that name;
+  // any other SNI is rejected with a TLS "internal error".
+  "sni": "game.xirix.li",
+
+  "fingerprint": "chrome",
+
+  // No local SOCKS/HTTP proxy for this use case.
+  "socks_listen": "", "http_listen": "",
+
+  // The 300 OpenVPN clients all connect to 0.0.0.0:2083 on this relay; each
+  // connection is tunneled to the OpenVPN server on the exit (127.0.0.1:2083).
+  "forwards": [
+    { "listen": "0.0.0.0:2083", "target": "127.0.0.1:2083" }
+  ],
+
+  // Tuned for many concurrent users: up to pool*concurrency = 32*32 = 1024
+  // streams. A larger pool means fewer users share each TCP session, so one
+  // user's packet loss does not head-of-line-block the others.
+  "mux": { "enabled": true, "concurrency": 32, "pool": 32 },
+
+  // Real ACME cert on the server, so verify it.
+  "allow_insecure": false,
+
+  "log": "info"
+}
