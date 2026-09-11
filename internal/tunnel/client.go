@@ -34,6 +34,10 @@ type Client struct {
 	mu       sync.Mutex
 	sessions []*muxSession
 	closed   bool
+
+	// dialMu serializes creation of new sessions so a burst of requests on a
+	// cold or saturated pool does not open dozens of TLS handshakes at once.
+	dialMu sync.Mutex
 }
 
 // muxSession is a pooled smux session plus the moment it last went idle.
@@ -123,10 +127,31 @@ func (c *Client) openMuxStream(ctx context.Context, target protocol.Address) (ne
 }
 
 // acquireSession returns a session with spare capacity, dialing one if needed.
+// New-session creation is serialized (see dialMu) so that a burst of requests
+// arriving on a cold or full pool does not fan out into a storm of concurrent
+// TLS handshakes, which both looks nothing like a browser and can overwhelm a
+// small VPS. Waiters re-check the pool after taking the dial lock, so most of
+// a burst is absorbed by the first session(s) created rather than each dialing.
 func (c *Client) acquireSession(ctx context.Context) (*muxSession, error) {
+	if s, dial := c.selectSession(); !dial {
+		return s, nil
+	}
+	c.dialMu.Lock()
+	defer c.dialMu.Unlock()
+	if s, dial := c.selectSession(); !dial {
+		return s, nil
+	}
+	return c.dialSession(ctx)
+}
+
+// selectSession picks an existing session to reuse, pruning closed ones. It
+// returns dial=true when the caller should create a new session instead: no
+// live session has spare capacity and the pool still has room to grow.
+func (c *Client) selectSession() (sess *muxSession, dial bool) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	live := c.sessions[:0]
-	var chosen, fallback *muxSession
+	var chosen, least *muxSession
 	for _, s := range c.sessions {
 		if s.IsClosed() {
 			continue
@@ -136,22 +161,19 @@ func (c *Client) acquireSession(ctx context.Context) (*muxSession, error) {
 		if chosen == nil && n < c.mux.Concurrency {
 			chosen = s
 		}
-		if fallback == nil || n < fallback.NumStreams() {
-			fallback = s
+		if least == nil || n < least.NumStreams() {
+			least = s
 		}
 	}
 	c.sessions = live
-	needNew := chosen == nil && len(c.sessions) < c.mux.Pool
-	c.mu.Unlock()
-
 	if chosen != nil {
-		return chosen, nil
+		return chosen, false
 	}
-	if !needNew && fallback != nil {
+	if len(c.sessions) >= c.mux.Pool && least != nil {
 		// Pool is saturated; reuse the least-loaded session anyway.
-		return fallback, nil
+		return least, false
 	}
-	return c.dialSession(ctx)
+	return nil, true
 }
 
 // dialSession creates a new authenticated smux session over TLS.
