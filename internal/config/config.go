@@ -117,7 +117,11 @@ func LoadClient(path string) (*ClientConfig, error) {
 		return nil, fmt.Errorf("config: password is required")
 	}
 	if c.Fingerprint == "" {
-		c.Fingerprint = "chrome"
+		// firefox, not chrome: modern Chrome's ClientHello carries a post-quantum
+		// (ML-KEM) key share (~1.7 KB) that spans two TCP packets, and censors
+		// (notably Iran's DPI) drop the split ClientHello. firefox's hello fits in
+		// a single packet and handshakes reliably.
+		c.Fingerprint = "firefox"
 	}
 	if c.SocksListen == "" && c.HTTPListen == "" && len(c.Forwards) == 0 {
 		c.SocksListen = "127.0.0.1:1080"

@@ -5,7 +5,11 @@
   // SNI to present; must match the server certificate's domain.
   "sni": "your-domain.example",
   // Browser TLS fingerprint to mimic: chrome|firefox|safari|ios|edge|random.
-  "fingerprint": "chrome",
+  // Prefer firefox or safari. Modern Chrome's ClientHello carries a post-quantum
+  // (ML-KEM) key share (~1.7 KB) that spans two TCP packets; some censors (e.g.
+  // Iran) drop the split ClientHello, causing handshake timeouts. firefox/safari
+  // fit in one packet.
+  "fingerprint": "firefox",
   // Local proxies. Point your browser/system at either.
   "socks_listen": "127.0.0.1:1080",
   "http_listen": "127.0.0.1:1081",

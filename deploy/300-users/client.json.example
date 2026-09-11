@@ -10,7 +10,11 @@
   // any other SNI is rejected with a TLS "internal error".
   "sni": "game.xirix.li",
 
-  "fingerprint": "chrome",
+  // IMPORTANT: use firefox/safari, NOT chrome. Modern Chrome's ClientHello
+  // carries a post-quantum (ML-KEM) key share (~1755 bytes) that spans two TCP
+  // packets; Iran's DPI drops the split ClientHello, so the handshake times out.
+  // firefox (~661B) and safari (~517B) fit in one packet and pass cleanly.
+  "fingerprint": "firefox",
 
   // No local SOCKS/HTTP proxy for this use case.
   "socks_listen": "", "http_listen": "",
