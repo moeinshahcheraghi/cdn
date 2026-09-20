@@ -72,7 +72,9 @@ func (s *Server) Handle(raw net.Conn) {
 		rc, err := transport.RealityHandshake(ctx, raw, s.reality)
 		cancel()
 		if err != nil {
-			logx.Debugf("server: reality from %s: %v", raw.RemoteAddr(), err)
+			// The library says exactly why (dest unreachable, auth failed,
+			// target sent an unexpected hello...); operators need to see it.
+			logx.Warnf("server: %v", err)
 			return
 		}
 		conn = rc

@@ -64,6 +64,7 @@ func main() {
 			logx.Errorf("%v", err)
 			os.Exit(1)
 		}
+		rc.Show = cfg.Log == "debug" // library-level trace of each handshake
 		srv.SetReality(rc)
 		logx.Infof("reality mode: imitating %s (sni %v)", cfg.Reality.Dest, cfg.Reality.ServerNames)
 	}
