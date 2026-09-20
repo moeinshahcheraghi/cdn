@@ -6,7 +6,23 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
+	"strings"
 )
+
+// mdLink matches "[text](url)": what a host looks like after being copied
+// from a chat or web page that auto-linked it. The text is what was meant.
+var mdLink = regexp.MustCompile(`^\[([^\]]+)\]\([^)]*\)$`)
+
+// cleanHost undoes markdown auto-linking and stray whitespace on a host or
+// host:port value, so a pasted config still works.
+func cleanHost(v string) string {
+	v = strings.TrimSpace(v)
+	if m := mdLink.FindStringSubmatch(v); m != nil {
+		v = m[1]
+	}
+	return v
+}
 
 // ServerConfig configures the tunnel server (the exit node).
 type ServerConfig struct {
@@ -116,6 +132,13 @@ func LoadServer(path string) (*ServerConfig, error) {
 	if err := readJSON(path, &c); err != nil {
 		return nil, err
 	}
+	c.Listen = cleanHost(c.Listen)
+	c.Fallback = cleanHost(c.Fallback)
+	c.ACME.Domain = cleanHost(c.ACME.Domain)
+	c.Reality.Dest = cleanHost(c.Reality.Dest)
+	for i := range c.Reality.ServerNames {
+		c.Reality.ServerNames[i] = cleanHost(c.Reality.ServerNames[i])
+	}
 	if c.Listen == "" {
 		c.Listen = ":443"
 	}
@@ -149,6 +172,15 @@ func LoadClient(path string) (*ClientConfig, error) {
 	var c ClientConfig
 	if err := readJSON(path, &c); err != nil {
 		return nil, err
+	}
+	c.Server = cleanHost(c.Server)
+	c.SNI = cleanHost(c.SNI)
+	for i := range c.Servers {
+		c.Servers[i] = cleanHost(c.Servers[i])
+	}
+	for i := range c.Forwards {
+		c.Forwards[i].Listen = cleanHost(c.Forwards[i].Listen)
+		c.Forwards[i].Target = cleanHost(c.Forwards[i].Target)
 	}
 	if c.Server == "" && len(c.Servers) > 0 {
 		c.Server = c.Servers[0]
