@@ -15,7 +15,10 @@ type Dialer struct {
 	SNI           string // ServerName to present
 	Fingerprint   string // browser to mimic
 	AllowInsecure bool   // skip cert verification (self-signed)
-	tcp           net.Dialer
+	// Reality, when set, replaces certificate-based TLS with the REALITY
+	// handshake (see reality.go); SNI is then the imitated site's name.
+	Reality *RealityClient
+	tcp     net.Dialer
 }
 
 // NewDialer builds a Dialer with sensible TCP timeouts and keepalive.
@@ -43,6 +46,21 @@ func (d *Dialer) Dial(ctx context.Context) (net.Conn, error) {
 	}
 	tcp := raw.(*net.TCPConn)
 	_ = tcp.SetNoDelay(true) // low latency: don't wait to coalesce small writes
+
+	if d.Reality != nil {
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = raw.SetDeadline(deadline)
+		} else {
+			_ = raw.SetDeadline(time.Now().Add(10 * time.Second))
+		}
+		conn, err := d.realityDial(ctx, raw)
+		if err != nil {
+			raw.Close()
+			return nil, err
+		}
+		_ = conn.SetDeadline(time.Time{})
+		return conn, nil
+	}
 
 	uconn := utls.UClient(raw, &utls.Config{
 		ServerName:         d.SNI,

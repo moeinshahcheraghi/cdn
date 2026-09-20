@@ -22,11 +22,31 @@ type ServerConfig struct {
 	// using the TLS-ALPN-01 challenge on this same listener, which therefore
 	// must be reachable on port 443 of Domain. Takes precedence over TLSCert.
 	ACME ACMEConfig `json:"acme"`
+	// Reality enables REALITY mode: the server imitates a real website whose
+	// name the censor already permits, needs no domain or certificate of its
+	// own, and hands probes the genuine site. When dest is set, acme/tls_cert
+	// are ignored. Generate keys with: tunnel-server -keygen
+	Reality RealityServerConfig `json:"reality"`
 	// Fallback is a real HTTP(S) origin that unauthenticated / probe traffic is
 	// reverse-proxied to, so the server is indistinguishable from a web server.
 	Fallback string `json:"fallback"`
 	// Log level: error|warn|info|debug.
 	Log string `json:"log"`
+}
+
+// RealityServerConfig is the server half of REALITY.
+type RealityServerConfig struct {
+	Dest        string   `json:"dest"`         // real site to imitate, host:443
+	ServerNames []string `json:"server_names"` // SNIs to accept; served by dest
+	PrivateKey  string   `json:"private_key"`  // from tunnel-server -keygen
+	ShortIDs    []string `json:"short_ids"`    // hex, per-client tags
+	MaxTimeDiff int      `json:"max_time_diff"` // seconds, 0 = unchecked
+}
+
+// RealityClientConfig is the client half of REALITY.
+type RealityClientConfig struct {
+	PublicKey string `json:"public_key"` // server's public key
+	ShortID   string `json:"short_id"`   // one of the server's short_ids
 }
 
 // ACMEConfig enables automatic certificates.
@@ -42,8 +62,12 @@ type ClientConfig struct {
 	Server string `json:"server"`
 	// Password must match one server password.
 	Password string `json:"password"`
-	// SNI presented in the TLS handshake; should match the server cert's name.
+	// SNI presented in the TLS handshake; should match the server cert's name,
+	// or in REALITY mode one of the server's server_names.
 	SNI string `json:"sni"`
+	// Reality, when public_key is set, uses the REALITY handshake instead of
+	// certificate verification. Server may then be a bare IP:port.
+	Reality RealityClientConfig `json:"reality"`
 	// Fingerprint mimics a browser's TLS ClientHello: chrome|firefox|safari|ios|edge|random.
 	Fingerprint string `json:"fingerprint"`
 	// SocksListen / HTTPListen are local proxy addresses (either may be empty).
@@ -73,6 +97,13 @@ type MuxConfig struct {
 	Enabled     bool `json:"enabled"`
 	Concurrency int  `json:"concurrency"` // max streams per physical connection
 	Pool        int  `json:"pool"`        // max idle physical connections
+	// RotateSeconds / RotateMB retire each TLS connection after at most this
+	// age or traffic (each connection draws a random fraction of both), and
+	// move its streams to a fresh connection without interrupting them. A
+	// censor sees only short, modest HTTPS sessions instead of one hours-long
+	// high-volume flow to throttle or flag. 0 disables that dimension.
+	RotateSeconds int `json:"rotate_seconds"`
+	RotateMB      int `json:"rotate_mb"`
 }
 
 // LoadServer reads and validates a server config file.
@@ -89,6 +120,11 @@ func LoadServer(path string) (*ServerConfig, error) {
 	}
 	if c.Fallback == "" {
 		c.Fallback = "example.com:443"
+	}
+	if c.Reality.Dest != "" {
+		if len(c.Reality.ServerNames) == 0 || c.Reality.PrivateKey == "" {
+			return nil, fmt.Errorf("config: reality needs server_names and private_key")
+		}
 	}
 	if c.ACME.Domain != "" {
 		if c.TLSCert != "" || c.TLSKey != "" {
@@ -140,6 +176,12 @@ func LoadClient(path string) (*ClientConfig, error) {
 		}
 		if c.Mux.Pool <= 0 {
 			c.Mux.Pool = 4
+		}
+		if c.Mux.RotateSeconds == 0 {
+			c.Mux.RotateSeconds = 300
+		}
+		if c.Mux.RotateMB == 0 {
+			c.Mux.RotateMB = 256
 		}
 	}
 	if c.Log == "" {

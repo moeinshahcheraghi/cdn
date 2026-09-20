@@ -28,7 +28,20 @@ const (
 	CmdUDPAssociate Command = 0x03
 	// CmdMux turns the connection into a smux session carrying many streams.
 	CmdMux Command = 0x7f
+
+	// CmdConnectR is CmdConnect on a resumable stream: an 8-byte stream id
+	// follows the metadata, and the stream may later be continued over
+	// another carrier with CmdResume.
+	CmdConnectR Command = 0x11
+	// CmdResume continues an existing resumable stream (address is ignored).
+	// The metadata is followed by the 8-byte stream id and the 8-byte offset
+	// the client has received; the server replies with one status byte
+	// (0 = ok) and the 8-byte offset it has received.
+	CmdResume Command = 0x12
 )
+
+// ResumeOK is the status byte for a successful CmdResume.
+const ResumeOK = 0
 
 // Address atypes, matching SOCKS5 so translation is trivial.
 const (

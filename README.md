@@ -80,6 +80,89 @@ Both ports actually accept *either* protocol (auto-detected).
 
 روی لینک ایران به خارج، فیلترینگ فقط یک HTTPS معمولی با اثرانگشت کروم می‌بیند.
 
+
+### شروع سریع با هر دامنه‌ای
+
+یک دامنه بردارید (مثلاً `example.com`) و رکورد A آن را به IP سرور خارج بزنید.
+در همه‌ی نمونه‌ها این‌ها را با مقادیر خودتان عوض کنید:
+
+- `DOMAIN` = دامنه‌ی شما، `SERVERIP` = IP سرور خارج
+- `PORT` = پورت تونل: اگر ۴۴۳ آزاد است `443`، وگرنه یک پورت آزاد مثل `8443`
+- `PASSWORD` = خروجی `openssl rand -hex 24` (همین یک رمز روی سرور و کلاینت یکی باشد)
+
+**۱) سرور خارج — `/etc/tunnel/server.json`** (یکی از دو حالت گواهی):
+
+حالت الف: پورت ۴۴۳ آزاد است، گواهی خودکار از Let's Encrypt:
+
+```json
+{
+  "listen": ":443",
+  "passwords": ["PASSWORD"],
+  "acme": { "domain": "DOMAIN", "email": "you@DOMAIN", "cache_dir": "/var/lib/tunnel/acme" },
+  "fallback": "www.wikipedia.org:443",
+  "log": "info"
+}
+```
+
+حالت ب: روی ۴۴۳ از قبل وب‌سرور/گواهی دارید، از همان گواهی و یک پورت دیگر استفاده کنید:
+
+```json
+{
+  "listen": ":8443",
+  "passwords": ["PASSWORD"],
+  "tls_cert": "/etc/letsencrypt/live/DOMAIN/fullchain.pem",
+  "tls_key":  "/etc/letsencrypt/live/DOMAIN/privkey.pem",
+  "fallback": "DOMAIN:443",
+  "log": "info"
+}
+```
+
+اجرا:
+
+```
+sudo cp bin/tunnel-server-linux-amd64 /usr/local/bin/tunnel-server
+sudo cp deploy/tunnel-server.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now tunnel-server
+sudo journalctl -u tunnel-server -f            # باید: server listening on :PORT
+```
+
+اگر پورتی غیر از ۴۴۳ گرفتید، آن پورت را در فایروال باز کنید.
+
+**۲) باکس ایران — `/etc/tunnel/client.json`:**
+
+```json
+{
+  "server": "DOMAIN:PORT",
+  "password": "PASSWORD",
+  "sni": "DOMAIN",
+  "fingerprint": "chrome",
+  "socks_listen": "", "http_listen": "",
+  "forwards": [{ "listen": "0.0.0.0:2083", "target": "127.0.0.1:2083" }],
+  "mux": { "enabled": true, "concurrency": 8, "pool": 4 },
+  "allow_insecure": false,
+  "log": "info"
+}
+```
+
+```
+sudo cp bin/tunnel-client-linux-amd64 /usr/local/bin/tunnel-client
+sudo cp deploy/tunnel-client.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now tunnel-client
+sudo journalctl -u tunnel-client -f            # باید: port forward 0.0.0.0:2083 -> ...
+```
+
+**۳) کاربر OpenVPN** — در فایل `.ovpn` فقط این دو خط:
+
+```
+remote <IP-باکس-ایران> 2083
+proto tcp
+```
+
+نکته‌ها:
+- `server` و `sni` را با **نام دامنه** بدهید (نه IP) تا گواهی تأیید شود.
+- OpenVPN سرور خارج باید TCP باشد (`proto tcp-server`) و `target` در کلاینت به همان پورت اشاره کند.
+- اگر کلاینت OpenVPN روی همان باکس ایرانِ تونل اجرا می‌شود، این خط را به `.ovpn` بیفزایید تا حلقه‌ی مسیریابی رخ ندهد: `route SERVERIP 255.255.255.255 net_gateway`.
+
 ### ۰. پیش‌نیازها
 
 - یک **سرور خارج** با یک **دامنه** که به IP آن اشاره می‌کند (رکورد A). دامنه لازم

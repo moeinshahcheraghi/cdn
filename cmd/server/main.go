@@ -5,10 +5,12 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/moeinshah0/tunnel/internal/config"
 	"github.com/moeinshah0/tunnel/internal/fallback"
@@ -19,7 +21,17 @@ import (
 
 func main() {
 	cfgPath := flag.String("c", "server.json", "path to server config JSON")
+	keygen := flag.Bool("keygen", false, "print a new REALITY key pair and exit")
 	flag.Parse()
+	if *keygen {
+		priv, pub, err := transport.GenerateRealityKeys()
+		if err != nil {
+			logx.Errorf("keygen: %v", err)
+			os.Exit(1)
+		}
+		fmt.Printf("private_key (server): %s\npublic_key  (client): %s\n", priv, pub)
+		return
+	}
 
 	cfg, err := config.LoadServer(*cfgPath)
 	if err != nil {
@@ -42,6 +54,19 @@ func main() {
 	}
 
 	srv := tunnel.NewServer(tlsCfg, cfg.Passwords, fallback.New(cfg.Fallback))
+	if cfg.Reality.Dest != "" {
+		rc, err := transport.NewRealityConfig(&transport.RealityServer{
+			Dest: cfg.Reality.Dest, ServerNames: cfg.Reality.ServerNames,
+			PrivateKey: cfg.Reality.PrivateKey, ShortIDs: cfg.Reality.ShortIDs,
+			MaxTimeDiff: time.Duration(cfg.Reality.MaxTimeDiff) * time.Second,
+		})
+		if err != nil {
+			logx.Errorf("%v", err)
+			os.Exit(1)
+		}
+		srv.SetReality(rc)
+		logx.Infof("reality mode: imitating %s (sni %v)", cfg.Reality.Dest, cfg.Reality.ServerNames)
+	}
 
 	ln, err := transport.Listen(cfg.Listen)
 	if err != nil {

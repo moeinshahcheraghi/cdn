@@ -5,6 +5,7 @@ package logx
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,24 +19,26 @@ const (
 	LevelDebug
 )
 
-var current = LevelInfo
+var current atomic.Int32 // Level
+
+func init() { current.Store(int32(LevelInfo)) }
 
 // SetLevel sets the global log level from a name (error/warn/info/debug).
 func SetLevel(name string) {
 	switch name {
 	case "error":
-		current = LevelError
+		current.Store(int32(LevelError))
 	case "warn":
-		current = LevelWarn
+		current.Store(int32(LevelWarn))
 	case "debug":
-		current = LevelDebug
+		current.Store(int32(LevelDebug))
 	default:
-		current = LevelInfo
+		current.Store(int32(LevelInfo))
 	}
 }
 
 func logf(l Level, tag, format string, args ...any) {
-	if l > current {
+	if int32(l) > current.Load() {
 		return
 	}
 	ts := time.Now().Format("2006-01-02 15:04:05")
