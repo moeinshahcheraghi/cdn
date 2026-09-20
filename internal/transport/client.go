@@ -14,9 +14,9 @@ import (
 type Dialer struct {
 	Server        string   // host:port of the server
 	Servers       []string // alternatives; each dial picks one at random
-	SNI           string // ServerName to present
-	Fingerprint   string // browser to mimic
-	AllowInsecure bool   // skip cert verification (self-signed)
+	SNI           string   // ServerName to present
+	Fingerprint   string   // browser to mimic
+	AllowInsecure bool     // skip cert verification (self-signed)
 	// Reality, when set, replaces certificate-based TLS with the REALITY
 	// handshake (see reality.go); SNI is then the imitated site's name.
 	Reality *RealityClient
