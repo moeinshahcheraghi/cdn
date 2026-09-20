@@ -1,3 +1,5 @@
+> **Recommended now: `deploy/reality-openvpn/`** (REALITY mode, no domain/cert, harder to detect). This directory is the older own-domain setup and still works.
+
 # راه‌اندازی تونل برای OpenVPN روی پورت 2083
 
 این پوشه یک جفت کانفیگ آماده دارد برای عبور OpenVPN (حالت TCP) از داخل تونلِ مقاومِ DPI.

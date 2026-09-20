@@ -28,7 +28,7 @@
   // Tuned for many concurrent users: up to pool*concurrency = 32*32 = 1024
   // streams. A larger pool means fewer users share each TCP session, so one
   // user's packet loss does not head-of-line-block the others.
-  "mux": { "enabled": true, "concurrency": 32, "pool": 32 },
+  "mux": { "enabled": true, "concurrency": 32, "pool": 32, "rotate_seconds": 300, "rotate_mb": 256 },
 
   // Real ACME cert on the server, so verify it.
   "allow_insecure": false,

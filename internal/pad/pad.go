@@ -9,10 +9,13 @@
 // style tunnels. Likewise, an 80-byte first record (a bare auth header) or a
 // metronomic 8-byte keepalive every 15 s look like nothing a browser sends.
 //
-// The layer is deliberately cheap: only the first few writes of each burst
-// (a burst starts after a short write-idle gap) are padded, which is exactly
-// where handshakes live. Bulk transfer inside a burst is passed through with
-// a 2-byte header per frame and no padding, so throughput is unaffected.
+// The layer is deliberately cheap: the first few writes of each burst (a
+// burst starts after a short write-idle gap) are padded to handshake-like
+// sizes, which is exactly where handshakes live; other small writes get a
+// little random jitter so fixed-size periodic packets (VPN pings, inner TCP
+// ACKs) do not repeat exact lengths. Bulk transfer inside a burst is passed
+// through with a 2-byte header per frame and no padding, so throughput is
+// unaffected.
 //
 // Wire format: each frame is a 2-byte big-endian header followed by the body.
 // Bit 15 of the header marks a padding-only frame whose body is discarded;
@@ -34,6 +37,10 @@ const (
 	flagPad  = 0x8000
 	padSmall = 1400 // writes below this are padded up to about one MTU
 	padLarge = 4096 // writes below this are padded up to a few segments
+	// jitter is the padding range for small writes outside a burst start:
+	// enough to break exact-size patterns (VPN keepalives, inner TCP ACKs)
+	// at a few percent of bandwidth.
+	jitter = 256
 
 	// burstWrites is how many leading writes of a burst get padding.
 	burstWrites = 4
@@ -93,6 +100,8 @@ func (c *Conn) Write(p []byte) (int, error) {
 	pad := 0
 	if c.burst < burstWrites {
 		pad = padLen(len(p))
+	} else if len(p) < padSmall {
+		pad = rand.IntN(jitter)
 	}
 	c.burst++
 

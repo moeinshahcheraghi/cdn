@@ -42,7 +42,7 @@ func TestHeadOfLineBlocking(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.Write([]byte{1}) // flush header
-		go func() {         // slow user: a trickle of reads, so the full window is advertised
+		go func() {        // slow user: a trickle of reads, so the full window is advertised
 			buf := make([]byte, 512)
 			for {
 				if _, err := s.Read(buf); err != nil {

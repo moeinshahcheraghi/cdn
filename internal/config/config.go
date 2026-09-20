@@ -36,10 +36,10 @@ type ServerConfig struct {
 
 // RealityServerConfig is the server half of REALITY.
 type RealityServerConfig struct {
-	Dest        string   `json:"dest"`         // real site to imitate, host:443
-	ServerNames []string `json:"server_names"` // SNIs to accept; served by dest
-	PrivateKey  string   `json:"private_key"`  // from tunnel-server -keygen
-	ShortIDs    []string `json:"short_ids"`    // hex, per-client tags
+	Dest        string   `json:"dest"`          // real site to imitate, host:443
+	ServerNames []string `json:"server_names"`  // SNIs to accept; served by dest
+	PrivateKey  string   `json:"private_key"`   // from tunnel-server -keygen
+	ShortIDs    []string `json:"short_ids"`     // hex, per-client tags
 	MaxTimeDiff int      `json:"max_time_diff"` // seconds, 0 = unchecked
 }
 
@@ -60,6 +60,10 @@ type ACMEConfig struct {
 type ClientConfig struct {
 	// Server is the tunnel server's host:port.
 	Server string `json:"server"`
+	// Servers optionally lists several exit servers (same password/keys);
+	// each new connection picks one at random, spreading traffic over more
+	// than one IP so no single one carries a suspicious volume.
+	Servers []string `json:"servers"`
 	// Password must match one server password.
 	Password string `json:"password"`
 	// SNI presented in the TLS handshake; should match the server cert's name,
@@ -145,6 +149,9 @@ func LoadClient(path string) (*ClientConfig, error) {
 	var c ClientConfig
 	if err := readJSON(path, &c); err != nil {
 		return nil, err
+	}
+	if c.Server == "" && len(c.Servers) > 0 {
+		c.Server = c.Servers[0]
 	}
 	if c.Server == "" {
 		return nil, fmt.Errorf("config: server is required")

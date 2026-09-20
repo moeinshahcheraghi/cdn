@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"time"
 
@@ -11,7 +12,8 @@ import (
 
 // Dialer establishes browser-looking TLS connections to the tunnel server.
 type Dialer struct {
-	Server        string // host:port of the server
+	Server        string   // host:port of the server
+	Servers       []string // alternatives; each dial picks one at random
 	SNI           string // ServerName to present
 	Fingerprint   string // browser to mimic
 	AllowInsecure bool   // skip cert verification (self-signed)
@@ -40,9 +42,13 @@ func NewDialer(server, sni, fingerprint string, insecure bool) *Dialer {
 // Dial opens a TCP connection and performs a uTLS handshake whose ClientHello
 // matches a real browser, so DPI fingerprinting (JA3/JA4) cannot flag it.
 func (d *Dialer) Dial(ctx context.Context) (net.Conn, error) {
-	raw, err := d.tcp.DialContext(ctx, "tcp", d.Server)
+	server := d.Server
+	if len(d.Servers) > 0 {
+		server = d.Servers[rand.IntN(len(d.Servers))]
+	}
+	raw, err := d.tcp.DialContext(ctx, "tcp", server)
 	if err != nil {
-		return nil, fmt.Errorf("transport: dial %s: %w", d.Server, err)
+		return nil, fmt.Errorf("transport: dial %s: %w", server, err)
 	}
 	tcp := raw.(*net.TCPConn)
 	_ = tcp.SetNoDelay(true) // low latency: don't wait to coalesce small writes

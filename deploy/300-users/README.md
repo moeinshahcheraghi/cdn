@@ -1,3 +1,5 @@
+> **Recommended now: `deploy/reality-openvpn/`** (REALITY mode, no domain/cert, harder to detect). This directory is the older own-domain setup and still works.
+
 # Deploying for ~300 concurrent OpenVPN users
 
 Topology: many OpenVPN clients → **Iran relay** (`tunnel-client`, public

@@ -81,6 +81,7 @@ func (c countConn) Write(p []byte) (int, error) {
 // NewClient constructs a tunnel client from validated config.
 func NewClient(c *config.ClientConfig) *Client {
 	dialer := transport.NewDialer(c.Server, c.SNI, c.Fingerprint, c.AllowInsecure)
+	dialer.Servers = c.Servers
 	if c.Reality.PublicKey != "" {
 		dialer.Reality = &transport.RealityClient{PublicKey: c.Reality.PublicKey, ShortID: c.Reality.ShortID}
 	}

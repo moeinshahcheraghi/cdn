@@ -20,8 +20,11 @@ active probing را خنثی می‌کند. محدودیت پهنای‌باند
 | Active probing | Wrong-auth connections are reverse-proxied to a real site |
 | Protocol/entropy analysis | It *is* real TLS 1.3, not an obfuscated stream |
 | Throughput/latency shaping | smux multiplexing, TCP NoDelay, BBR, no rate limit |
-| TLS-in-TLS record-size shape | payload is framed and randomly padded, so the tell-tale handshake/keepalive record sizes are hidden |
+| TLS-in-TLS record-size shape | payload is framed and randomly padded, so the tell-tale handshake/keepalive record sizes are hidden; small records get size jitter |
 | Long-flow keepalive fingerprint | no application-layer keepalive; liveness is kernel TCP keepalive, and idle sessions are retired |
+| Unknown domain on a datacenter IP | **REALITY mode**: SNI and certificate of a big allowed site; probes are spliced to the real site and see its genuine chain; no domain/cert of your own |
+| Long, high-volume flows throttled or flagged | **rotating carriers**: every TLS connection is retired after a random few minutes / few hundred MB and user streams continue seamlessly on a fresh one (resumable streams) |
+| One exit IP carrying everything | `servers`: several exits, each connection picks one at random |
 
 The wire format follows the Trojan idea: after the TLS handshake, a client sends
 a 56-byte SHA-224 password digest; a peer that does not is indistinguishable from
@@ -309,6 +312,49 @@ proto tcp
 
 برای دیدن جزئیات، `"log": "debug"` بگذارید و سرویس را ری‌استارت کنید.
 
+## REALITY mode (recommended)
+
+Instead of your own domain and certificate, the server borrows the identity
+of a real, popular site. Generate keys once:
+
+```
+tunnel-server -keygen
+```
+
+Server:
+
+```json
+"reality": { "dest": "www.microsoft.com:443", "server_names": ["www.microsoft.com"],
+             "private_key": "<private>", "short_ids": ["a1b2c3d4"], "max_time_diff": 120 }
+```
+
+Client (`server` can be a bare IP; `sni` must be one of `server_names`):
+
+```json
+"server": "1.2.3.4:443", "sni": "www.microsoft.com", "fingerprint": "firefox",
+"reality": { "public_key": "<public>", "short_id": "a1b2c3d4" }
+```
+
+Anyone connecting without the key is transparently spliced to the real site
+and receives its real certificate. Keep both clocks NTP-synced.
+`deploy/reality-openvpn/` has a complete pair of configs with a Persian guide.
+
+## Rotating carriers
+
+With `mux` on, each TLS connection lives at most `rotate_seconds` (default
+300) or `rotate_mb` (default 256), each connection drawing a random 50-100%
+of both. Streams are resumable: when a connection is retired the client
+continues every stream on a fresh connection from the exact byte the server
+last received, so an OpenVPN session survives hundreds of rotations. Set a
+value to 0 to disable that dimension.
+
+## Diagnostics
+
+`tunnel-client -c client.json -diag` tests TCP connect, the handshake with
+every browser fingerprint (and prints each ClientHello's size, since hellos
+over one packet are dropped by some censors), and finally opens a real tunnel
+stream, so a failing site can be classified in seconds.
+
 ## Putting OpenVPN (or any TCP service) behind the tunnel
 
 Use the client's `forwards` for a relay setup: users connect to a server inside
@@ -337,8 +383,10 @@ and the exit server; the OpenVPN protocol never appears on that link.
 ## Configuration
 
 See `server.example.json` and `client.example.json`; every field is commented.
-Key client options: `fingerprint` (chrome/firefox/safari/ios/edge/random),
-`mux` (multiplexing for low latency), `sni` (must match the server cert),
+Key client options: `fingerprint` (firefox/safari/ios/edge/chrome/random;
+firefox is the default, chrome's ML-KEM hello is two packets and gets
+dropped), `mux` (multiplexing, rotation), `sni` (server cert name, or the
+imitated site in REALITY mode), `reality`, `servers`, `forwards`,
 `allow_insecure` (only for a self-signed server).
 
 ## Notes and limits
