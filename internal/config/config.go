@@ -27,6 +27,8 @@ func cleanHost(v string) string {
 // ServerConfig configures the tunnel server (the exit node).
 type ServerConfig struct {
 	// Listen is the public address, normally ":443" to blend with HTTPS.
+	// Several comma-separated addresses may be given (":443,:8443"); clients
+	// can then spread their connections over the ports as well.
 	Listen string `json:"listen"`
 	// Passwords accepted from clients. Any match authenticates.
 	Passwords []string `json:"passwords"`
@@ -43,6 +45,9 @@ type ServerConfig struct {
 	// own, and hands probes the genuine site. When dest is set, acme/tls_cert
 	// are ignored. Generate keys with: tunnel-server -keygen
 	Reality RealityServerConfig `json:"reality"`
+	// WS accepts the tunnel inside a WebSocket so clients can come through a
+	// CDN (Cloudflare) when the server's own IP is blocked or unreachable.
+	WS WSServerConfig `json:"ws"`
 	// Fallback is a real HTTP(S) origin that unauthenticated / probe traffic is
 	// reverse-proxied to, so the server is indistinguishable from a web server.
 	Fallback string `json:"fallback"`
@@ -57,6 +62,35 @@ type RealityServerConfig struct {
 	PrivateKey  string   `json:"private_key"`   // from tunnel-server -keygen
 	ShortIDs    []string `json:"short_ids"`     // hex, per-client tags
 	MaxTimeDiff int      `json:"max_time_diff"` // seconds, 0 = unchecked
+}
+
+// WSServerConfig is the server half of the WebSocket/CDN transport.
+type WSServerConfig struct {
+	// Path is the secret URL path that upgrades to the tunnel; every other
+	// request is served by the fallback site. Empty disables WebSocket.
+	Path string `json:"path"`
+	// Listen is an extra certificate-TLS listener for the CDN to connect to.
+	// Needed in REALITY mode, whose main port cannot serve a CDN; without
+	// REALITY it may stay empty and the main port accepts both.
+	Listen string `json:"listen"`
+}
+
+// WSClientConfig is the client half of the WebSocket/CDN transport.
+type WSClientConfig struct {
+	Path string `json:"path"` // the server's ws.path; empty = no WebSocket
+	Host string `json:"host"` // Host header, defaults to sni
+}
+
+// Backup is an alternative route to the same server, used only while the
+// primary one (server/servers) is failing. Typically the CDN route.
+type Backup struct {
+	Server        string              `json:"server"`
+	Servers       []string            `json:"servers"`
+	SNI           string              `json:"sni"`
+	Fingerprint   string              `json:"fingerprint"`
+	Reality       RealityClientConfig `json:"reality"`
+	WS            WSClientConfig      `json:"ws"`
+	AllowInsecure bool                `json:"allow_insecure"`
 }
 
 // RealityClientConfig is the client half of REALITY.
@@ -88,6 +122,11 @@ type ClientConfig struct {
 	// Reality, when public_key is set, uses the REALITY handshake instead of
 	// certificate verification. Server may then be a bare IP:port.
 	Reality RealityClientConfig `json:"reality"`
+	// WS, when path is set, carries the tunnel in a WebSocket (through a CDN:
+	// server is then the CDN-proxied domain or a CDN IP, sni the domain).
+	WS WSClientConfig `json:"ws"`
+	// Backups are alternative routes tried while the primary one fails.
+	Backups []Backup `json:"backups"`
 	// Fingerprint mimics a browser's TLS ClientHello: chrome|firefox|safari|ios|edge|random.
 	Fingerprint string `json:"fingerprint"`
 	// SocksListen / HTTPListen are local proxy addresses (either may be empty).
@@ -153,6 +192,19 @@ func LoadServer(path string) (*ServerConfig, error) {
 			return nil, fmt.Errorf("config: reality needs server_names and private_key")
 		}
 	}
+	c.WS.Listen = cleanHost(c.WS.Listen)
+	if c.WS.Path != "" && !strings.HasPrefix(c.WS.Path, "/") {
+		c.WS.Path = "/" + c.WS.Path
+	}
+	if c.WS.Path != "" && len(c.WS.Path) < 8 {
+		return nil, fmt.Errorf("config: ws.path is a secret; make it at least 8 characters")
+	}
+	if c.WS.Listen != "" && c.WS.Path == "" {
+		return nil, fmt.Errorf("config: ws.listen needs ws.path")
+	}
+	if c.Reality.Dest != "" && c.WS.Path != "" && c.WS.Listen == "" {
+		return nil, fmt.Errorf("config: in reality mode the websocket needs its own port: set ws.listen (e.g. \":8443\")")
+	}
 	if c.ACME.Domain != "" {
 		if c.TLSCert != "" || c.TLSKey != "" {
 			return nil, fmt.Errorf("config: use either acme or tls_cert/tls_key, not both")
@@ -182,6 +234,22 @@ func LoadClient(path string) (*ClientConfig, error) {
 		c.Forwards[i].Listen = cleanHost(c.Forwards[i].Listen)
 		c.Forwards[i].Target = cleanHost(c.Forwards[i].Target)
 	}
+	if c.Reality.PublicKey != "" && c.WS.Path != "" {
+		return nil, fmt.Errorf("config: reality and ws cannot be combined on one route; put the ws route in backups")
+	}
+	for i := range c.Backups {
+		b := &c.Backups[i]
+		b.Server, b.SNI = cleanHost(b.Server), cleanHost(b.SNI)
+		for j := range b.Servers {
+			b.Servers[j] = cleanHost(b.Servers[j])
+		}
+		if b.Server == "" && len(b.Servers) == 0 {
+			return nil, fmt.Errorf("config: backups[%d]: server is required", i)
+		}
+		if b.Reality.PublicKey != "" && b.WS.Path != "" {
+			return nil, fmt.Errorf("config: backups[%d]: reality and ws cannot be combined", i)
+		}
+	}
 	if c.Server == "" && len(c.Servers) > 0 {
 		c.Server = c.Servers[0]
 	}
@@ -197,6 +265,11 @@ func LoadClient(path string) (*ClientConfig, error) {
 		// (notably Iran's DPI) drop the split ClientHello. firefox's hello fits in
 		// a single packet and handshakes reliably.
 		c.Fingerprint = "firefox"
+	}
+	for i := range c.Backups {
+		if c.Backups[i].Fingerprint == "" {
+			c.Backups[i].Fingerprint = c.Fingerprint
+		}
 	}
 	if c.SocksListen == "" && c.HTTPListen == "" && len(c.Forwards) == 0 {
 		c.SocksListen = "127.0.0.1:1080"

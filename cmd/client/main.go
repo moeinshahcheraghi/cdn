@@ -91,30 +91,22 @@ func acceptLoop(ln net.Listener, client *tunnel.Client) {
 	}
 }
 
-// runDiag reports, stage by stage, whether and how fast the server can be
-// reached, so a failing datacenter can be told apart: TCP blocked (IP),
-// handshake dropped (SNI/fingerprint), or tunnel refused (password/keys).
+// runDiag reports, stage by stage, whether and how fast each route can be
+// reached, so a failing datacenter can be classified in seconds: TCP blocked
+// (the IP is filtered), handshake dropped (SNI/fingerprint/port), clock wrong
+// (REALITY rejects the token), or the tunnel itself refused (password/keys).
 func runDiag(cfg *config.ClientConfig) int {
-	servers := cfg.Servers
-	if len(servers) == 0 {
-		servers = []string{cfg.Server}
-	}
-	mode := "tls"
-	if cfg.Reality.PublicKey != "" {
-		mode = "reality"
-	}
-	fmt.Printf("mode=%s sni=%s fingerprint=%s\n", mode, cfg.SNI, cfg.Fingerprint)
+	eps := tunnel.Endpoints(cfg)
+	fmt.Printf("clock: %s\n", time.Now().Format(time.RFC1123))
 	for _, fp := range transport.Fingerprints {
-		fmt.Printf("  clienthello %-8s %5d bytes\n", fp, transport.HelloSize(fp, cfg.SNI))
+		fmt.Printf("  clienthello %-8s %5d bytes%s\n", fp, transport.HelloSize(fp, cfg.SNI),
+			map[bool]string{true: "  (over one packet: some censors drop it)"}[transport.HelloSize(fp, cfg.SNI) > 1400])
 	}
-	d := transport.NewDialer(cfg.Server, cfg.SNI, cfg.Fingerprint, cfg.AllowInsecure)
-	if mode == "reality" {
-		d.Reality = &transport.RealityClient{PublicKey: cfg.Reality.PublicKey, ShortID: cfg.Reality.ShortID}
-	}
-	failed := 0
-	for _, srv := range servers {
-		fmt.Printf("server %s\n", srv)
-		fps := append([]string{cfg.Fingerprint}, transport.Fingerprints...)
+	d := transport.NewDialer(eps)
+	failed, worked := 0, 0
+	for _, ep := range d.Endpoints() {
+		fmt.Printf("endpoint %s tier=%d\n", ep, ep.Tier)
+		fps := append([]string{ep.Fingerprint}, transport.Fingerprints...)
 		seen := map[string]bool{}
 		for _, fp := range fps {
 			if seen[fp] {
@@ -122,19 +114,38 @@ func runDiag(cfg *config.ClientConfig) int {
 			}
 			seen[fp] = true
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			tcp, tls, err := d.Probe(ctx, srv, fp)
+			tcp, hs, err := d.Probe(ctx, ep, fp)
 			cancel()
 			switch {
-			case err != nil && tls == 0:
+			case err != nil && hs == 0:
 				fmt.Printf("  %-8s TCP connect FAILED after %v: %v\n", fp, tcp.Round(time.Millisecond), err)
 				failed++
 			case err != nil:
-				fmt.Printf("  %-8s tcp %v, handshake FAILED after %v: %v\n", fp, tcp.Round(time.Millisecond), tls.Round(time.Millisecond), err)
+				fmt.Printf("  %-8s tcp %v, handshake FAILED after %v: %v\n", fp, tcp.Round(time.Millisecond), hs.Round(time.Millisecond), err)
 				failed++
 			default:
-				fmt.Printf("  %-8s tcp %v, handshake ok %v\n", fp, tcp.Round(time.Millisecond), tls.Round(time.Millisecond))
+				fmt.Printf("  %-8s tcp %v, handshake ok %v\n", fp, tcp.Round(time.Millisecond), hs.Round(time.Millisecond))
+				worked++
 			}
 		}
+		// A wrong local clock makes REALITY reject every handshake while
+		// nothing is actually blocked; name it rather than leave it a mystery.
+		if ep.Reality != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			remote, err := transport.RemoteTime(ctx, d.TCPDialer(), ep)
+			cancel()
+			if err == nil {
+				if skew := time.Until(remote); skew > 30*time.Second || skew < -30*time.Second {
+					fmt.Printf("  CLOCK is off by %v — REALITY tokens are time-bound; run: timedatectl set-ntp true\n", (-skew).Round(time.Second))
+				} else {
+					fmt.Printf("  clock agrees with %s (%v)\n", ep.SNI, skew.Round(time.Second))
+				}
+			}
+		}
+	}
+	if worked == 0 {
+		fmt.Printf("\nNo route handshakes. The exit IP looks blocked from here: add a CDN backup route (ws) or another exit to \"servers\".\n")
+		return 1
 	}
 	// Full tunnel check with the configured settings: a stream that the
 	// server can open to its target stays up; a refused password or an

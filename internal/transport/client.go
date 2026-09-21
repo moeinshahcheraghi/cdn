@@ -2,89 +2,319 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+
+	"github.com/moeinshah0/tunnel/internal/logx"
+	"github.com/moeinshah0/tunnel/internal/wsconn"
 )
 
-// Dialer establishes browser-looking TLS connections to the tunnel server.
-type Dialer struct {
-	Server        string   // host:port of the server
-	Servers       []string // alternatives; each dial picks one at random
-	SNI           string   // ServerName to present
-	Fingerprint   string   // browser to mimic
-	AllowInsecure bool     // skip cert verification (self-signed)
+// Endpoint is one way of reaching the tunnel server: an address plus how to
+// dress the connection (plain TLS, REALITY, or a WebSocket through a CDN).
+type Endpoint struct {
+	Server        string // host:port to connect to
+	SNI           string // ServerName to present
+	Fingerprint   string // browser to mimic
+	AllowInsecure bool   // skip cert verification (self-signed)
 	// Reality, when set, replaces certificate-based TLS with the REALITY
 	// handshake (see reality.go); SNI is then the imitated site's name.
 	Reality *RealityClient
-	tcp     net.Dialer
+	// WS, when set, wraps the stream in a WebSocket so it can pass a CDN.
+	WS *WSClient
+	// Tier orders endpoints: a higher tier is used only while every endpoint
+	// of the lower tiers is failing (0 = primary, 1 = backup).
+	Tier int
+
+	// health, guarded by Dialer.mu
+	fails     int
+	downUntil time.Time
+	probing   bool
 }
 
-// NewDialer builds a Dialer with sensible TCP timeouts and keepalive.
-func NewDialer(server, sni, fingerprint string, insecure bool) *Dialer {
-	if sni == "" {
-		if host, _, err := net.SplitHostPort(server); err == nil {
-			sni = host
+// WSClient configures the WebSocket wrapping of an endpoint.
+type WSClient struct {
+	Path string // must equal the server's ws.path
+	Host string // Host header; defaults to the SNI
+}
+
+func (e *Endpoint) String() string {
+	mode := "tls"
+	switch {
+	case e.Reality != nil:
+		mode = "reality"
+	case e.WS != nil:
+		mode = "ws"
+	}
+	return fmt.Sprintf("%s (%s, sni %s)", e.Server, mode, e.SNI)
+}
+
+// attemptTimeout bounds one endpoint attempt so a black-holed endpoint does
+// not use up the caller's whole budget before the next one is tried.
+const attemptTimeout = 8 * time.Second
+
+// Dialer establishes browser-looking connections to the tunnel server over
+// whichever endpoint currently works.
+type Dialer struct {
+	mu  sync.Mutex
+	eps []*Endpoint
+	tcp net.Dialer
+}
+
+// NewDialer builds a Dialer over eps with sensible TCP timeouts and keepalive.
+func NewDialer(eps []Endpoint) *Dialer {
+	d := &Dialer{tcp: net.Dialer{Timeout: attemptTimeout, KeepAliveConfig: KeepAlive, Control: clientControl}}
+	for i := range eps {
+		ep := eps[i]
+		if ep.SNI == "" {
+			if host, _, err := net.SplitHostPort(ep.Server); err == nil {
+				ep.SNI = host
+			}
 		}
+		d.eps = append(d.eps, &ep)
 	}
-	return &Dialer{
-		Server:        server,
-		SNI:           sni,
-		Fingerprint:   fingerprint,
-		AllowInsecure: insecure,
-		tcp:           net.Dialer{Timeout: 10 * time.Second, KeepAliveConfig: KeepAlive},
-	}
+	return d
 }
 
-// Dial opens a TCP connection and performs a uTLS handshake whose ClientHello
-// matches a real browser, so DPI fingerprinting (JA3/JA4) cannot flag it.
+// Endpoints returns the configured endpoints, for diagnostics.
+func (d *Dialer) Endpoints() []*Endpoint { return d.eps }
+
+// Dial connects over the best available endpoint: a random healthy one of
+// the lowest tier, falling through to the others when it fails. Endpoints
+// that fail are set aside with exponential backoff and re-tested in the
+// background, so neither a blocked exit IP nor its recovery costs users more
+// than one slow connection attempt.
 func (d *Dialer) Dial(ctx context.Context) (net.Conn, error) {
-	server := d.Server
-	if len(d.Servers) > 0 {
-		server = d.Servers[rand.IntN(len(d.Servers))]
-	}
-	raw, err := d.tcp.DialContext(ctx, "tcp", server)
-	if err != nil {
-		return nil, fmt.Errorf("transport: dial %s: %w", server, err)
-	}
-	tcp := raw.(*net.TCPConn)
-	_ = tcp.SetNoDelay(true) // low latency: don't wait to coalesce small writes
-
-	if d.Reality != nil {
-		if deadline, ok := ctx.Deadline(); ok {
-			_ = raw.SetDeadline(deadline)
-		} else {
-			_ = raw.SetDeadline(time.Now().Add(10 * time.Second))
+	var errs []error
+	for _, ep := range d.order() {
+		if ctx.Err() != nil {
+			break
 		}
-		conn, err := d.realityDial(ctx, raw)
-		if err != nil {
+		actx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		conn, err := d.DialEndpoint(actx, ep, "")
+		cancel()
+		if err == nil {
+			d.report(ep, nil)
+			return conn, nil
+		}
+		d.report(ep, err)
+		errs = append(errs, err)
+	}
+	if len(errs) == 0 {
+		return nil, ctx.Err()
+	}
+	return nil, errors.Join(errs...)
+}
+
+// order returns the endpoints to try: healthy ones by tier (shuffled within
+// a tier, which is what spreads load over several exits), then the ones in
+// backoff as a last resort. Endpoints whose backoff just ended are re-tested
+// off the request path.
+func (d *Dialer) order() []*Endpoint {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	var up, down []*Endpoint
+	for _, ep := range d.eps {
+		switch {
+		case ep.fails == 0:
+			up = append(up, ep)
+		case now.After(ep.downUntil) && !ep.probing:
+			ep.probing = true
+			go d.reprobe(ep)
+			down = append(down, ep)
+		default:
+			down = append(down, ep)
+		}
+	}
+	rand.Shuffle(len(up), func(i, j int) { up[i], up[j] = up[j], up[i] })
+	rand.Shuffle(len(down), func(i, j int) { down[i], down[j] = down[j], down[i] })
+	byTier := func(s []*Endpoint) {
+		// stable insertion sort; the lists are tiny
+		for i := 1; i < len(s); i++ {
+			for j := i; j > 0 && s[j].Tier < s[j-1].Tier; j-- {
+				s[j], s[j-1] = s[j-1], s[j]
+			}
+		}
+	}
+	byTier(up)
+	byTier(down)
+	return append(up, down...)
+}
+
+// reprobe tests a failed endpoint with a handshake of its own.
+func (d *Dialer) reprobe(ep *Endpoint) {
+	ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+	conn, err := d.DialEndpoint(ctx, ep, "")
+	cancel()
+	if err == nil {
+		conn.Close()
+	}
+	d.mu.Lock()
+	ep.probing = false
+	d.mu.Unlock()
+	d.report(ep, err)
+}
+
+// ReportStall records that connections over ep stopped moving data after
+// the handshake, which counts against it like a failed dial.
+func (d *Dialer) ReportStall(ep *Endpoint) {
+	if ep != nil {
+		d.report(ep, errors.New("connection stalled"))
+	}
+}
+
+func (d *Dialer) report(ep *Endpoint, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err == nil {
+		if ep.fails > 0 {
+			logx.Infof("endpoint %s is back", ep)
+		}
+		ep.fails = 0
+		return
+	}
+	ep.fails++
+	backoff := 5 * time.Second << min(ep.fails-1, 5)
+	if backoff > 2*time.Minute {
+		backoff = 2 * time.Minute
+	}
+	ep.downUntil = time.Now().Add(backoff)
+	if ep.fails == 1 {
+		logx.Warnf("endpoint %s failing: %v", ep, err)
+	}
+}
+
+// DialEndpoint connects over one specific endpoint. fp overrides the
+// endpoint's fingerprint when not empty (diagnostics).
+func (d *Dialer) DialEndpoint(ctx context.Context, ep *Endpoint, fp string) (net.Conn, error) {
+	raw, err := d.tcp.DialContext(ctx, "tcp", ep.Server)
+	if err != nil {
+		return nil, fmt.Errorf("transport: dial %s: %w", ep.Server, err)
+	}
+	conn, err := d.handshake(ctx, raw, ep, fp)
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+	return &epConn{Conn: conn, ep: ep}, nil
+}
+
+// handshake dresses raw according to ep.
+func (d *Dialer) handshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp string) (net.Conn, error) {
+	if fp == "" {
+		fp = ep.Fingerprint
+	}
+	_ = raw.(*net.TCPConn).SetNoDelay(true) // low latency: don't wait to coalesce small writes
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = raw.SetDeadline(deadline)
+	} else {
+		_ = raw.SetDeadline(time.Now().Add(attemptTimeout))
+	}
+	defer raw.SetDeadline(time.Time{})
+
+	if ep.Reality != nil {
+		conn, err := realityDial(ctx, raw, ep, fp)
+		if errors.Is(err, errRealityRejected) && syncClock(ctx, &d.tcp, ep) {
+			// Our clock was wrong and is now compensated; the token is bound
+			// to the time, so try once more on a fresh connection.
+			raw2, derr := d.tcp.DialContext(ctx, "tcp", ep.Server)
+			if derr != nil {
+				return nil, err
+			}
+			_ = raw2.(*net.TCPConn).SetNoDelay(true)
+			if deadline, ok := ctx.Deadline(); ok {
+				_ = raw2.SetDeadline(deadline)
+			}
+			conn, err = realityDial(ctx, raw2, ep, fp)
+			if err != nil {
+				raw2.Close()
+				return nil, err
+			}
 			raw.Close()
+			_ = raw2.SetDeadline(time.Time{})
+		}
+		return conn, err
+	}
+
+	cfg := &utls.Config{
+		ServerName:         ep.SNI,
+		InsecureSkipVerify: ep.AllowInsecure,
+		NextProtos:         []string{"h2", "http/1.1"},
+	}
+	var uconn *utls.UConn
+	if ep.WS != nil {
+		// A browser opening a WebSocket offers only http/1.1, and the upgrade
+		// below needs it: over h2 the CDN would expect an HTTP/2 request.
+		cfg.NextProtos = []string{"http/1.1"}
+		var err error
+		if uconn, err = http1Client(raw, cfg, fp); err != nil {
 			return nil, err
 		}
-		_ = conn.SetDeadline(time.Time{})
-		return conn, nil
-	}
-
-	uconn := utls.UClient(raw, &utls.Config{
-		ServerName:         d.SNI,
-		InsecureSkipVerify: d.AllowInsecure,
-		NextProtos:         []string{"h2", "http/1.1"},
-	}, clientHelloID(d.Fingerprint))
-
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = uconn.SetDeadline(deadline)
 	} else {
-		_ = uconn.SetDeadline(time.Now().Add(10 * time.Second))
+		uconn = utls.UClient(raw, cfg, clientHelloID(fp))
 	}
 	if err := uconn.HandshakeContext(ctx); err != nil {
-		raw.Close()
 		return nil, fmt.Errorf("transport: tls handshake: %w", err)
 	}
-	_ = uconn.SetDeadline(time.Time{})
+	if ep.WS == nil {
+		return uconn, nil
+	}
+	host := ep.WS.Host
+	if host == "" {
+		host = ep.SNI
+	}
+	ws, err := wsconn.Dial(uconn, host, ep.WS.Path)
+	if err != nil {
+		return nil, fmt.Errorf("transport: %w", err)
+	}
+	return ws, nil
+}
+
+// http1Client is utls.UClient with the fingerprint's ALPN list reduced to
+// http/1.1; everything else in the ClientHello stays the browser's.
+func http1Client(raw net.Conn, cfg *utls.Config, fp string) (*utls.UConn, error) {
+	spec, err := utls.UTLSIdToSpec(clientHelloID(fp))
+	if err != nil {
+		return nil, fmt.Errorf("transport: fingerprint %q: %w", fp, err)
+	}
+	for _, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{"http/1.1"}
+		}
+	}
+	uconn := utls.UClient(raw, cfg, utls.HelloCustom)
+	if err := uconn.ApplyPreset(&spec); err != nil {
+		return nil, fmt.Errorf("transport: apply fingerprint: %w", err)
+	}
 	return uconn, nil
+}
+
+// epConn remembers which endpoint a connection used, so stalls on it can be
+// held against that endpoint.
+type epConn struct {
+	net.Conn
+	ep *Endpoint
+}
+
+// EndpointOf returns the endpoint conn was dialed over, or nil.
+func EndpointOf(conn net.Conn) *Endpoint {
+	if c, ok := conn.(*epConn); ok {
+		return c.ep
+	}
+	return nil
+}
+
+func (c *epConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
 }
 
 // clientHelloID maps a name to a uTLS fingerprint, defaulting to auto-Chrome.

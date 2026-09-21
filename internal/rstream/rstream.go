@@ -16,8 +16,16 @@
 // duplicates are discarded by offset. Frames on the carrier are:
 //
 //	DATA  0x01 | offset u64 | length u16 | payload
-//	ACK   0x02 | offset u64
+//	ACK   0x02 | received u64 | consumed u64
 //	FIN   0x03 | offset u64            (no more data after offset)
+//
+// An ACK carries two offsets. "received" lets the sender drop its
+// retransmission copy and proves the carrier is moving (see Stalled).
+// "consumed" is how far the peer's application has actually read, and it is
+// what the send window is measured against: a slow reader therefore pushes
+// back on the writer, and neither side ever buffers more than one window.
+// Without that, a user on a slow link would make the relay queue an unbounded
+// amount of data in memory and add seconds of latency (bufferbloat).
 //
 // Both peers run the same code; only who initiates a resume differs.
 package rstream
@@ -37,11 +45,13 @@ const (
 	frameFin  = 0x03
 
 	hdrLen     = 1 + 8
-	maxPayload = 32 * 1024
+	ackLen     = 1 + 8 + 8
+	maxPayload = 16 * 1024
 
-	// window bounds unacknowledged bytes the sender holds for retransmission;
-	// a writer blocks when it is full.
-	window = 4 << 20
+	// window bounds the bytes written but not yet consumed by the peer's
+	// application; a writer blocks when it is full. It is also the most either
+	// side ever buffers per direction.
+	window = 2 << 20
 	// ackEvery is how many received bytes trigger an acknowledgement; a
 	// timer flushes the tail.
 	ackEvery = 256 << 10
@@ -64,11 +74,13 @@ type Stream struct {
 	cond *sync.Cond // broadcast on any state change
 
 	// send side; offsets are absolute.
-	sendBuf  []byte // bytes [sendBase, sendBase+len) awaiting acknowledgement
-	sendBase uint64
-	sentOff  uint64 // next offset to transmit on the current carrier
-	finOff   uint64 // valid when writeClosed
-	finSent  bool   // FIN transmitted on the current carrier
+	sendBuf      []byte // bytes [sendBase, sendBase+len) awaiting acknowledgement
+	sendBase     uint64
+	sentOff      uint64    // next offset to transmit on the current carrier
+	peerConsumed uint64    // highest offset the peer's application has read
+	progressAt   time.Time // last time the peer acknowledged new data, or data became outstanding
+	finOff       uint64    // valid when writeClosed
+	finSent      bool      // FIN transmitted on the current carrier
 
 	// receive side.
 	recvBuf    []byte
@@ -76,6 +88,7 @@ type Stream struct {
 	peerFin    bool
 	peerFinOff uint64
 	lastAcked  uint64 // recvOff last acknowledged to the peer
+	lastCons   uint64 // consumed offset last reported to the peer
 	ackTimer   *time.Timer
 	ackFlush   bool // delayed ACK is due
 
@@ -91,8 +104,9 @@ type Stream struct {
 	resumeTimeout time.Duration
 	resumeTimer   *time.Timer
 
-	readDeadline time.Time
-	onClose      func()
+	readDeadline  time.Time
+	onClose       func()
+	onCarrierLost func()
 }
 
 // New creates a stream with the given id, starting at offset 0 on both
@@ -122,6 +136,82 @@ func (s *Stream) SetOnClose(f func()) {
 	s.mu.Unlock()
 }
 
+// SetOnCarrierLost registers a callback run (on its own goroutine) whenever
+// the carrier fails underneath a live stream, so the owner can resume it at
+// once instead of waiting for a periodic check.
+func (s *Stream) SetOnCarrierLost(f func()) {
+	s.mu.Lock()
+	s.onCarrierLost = f
+	s.mu.Unlock()
+}
+
+// Fresh reports whether the peer has never confirmed anything on this
+// stream: it acknowledged no byte we sent and we received none. Such a
+// stream can be restarted from scratch rather than resumed — whatever we
+// wrote went into a connection that died with it, so the far end either
+// never saw it or is about to drop it unread.
+func (s *Stream) Fresh() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sendBase == 0 && s.recvOff == 0 && !s.closed
+}
+
+// Finished reports whether the stream no longer needs a carrier: everything
+// the peer will ever send has arrived, and everything we sent, our FIN
+// included, has been acknowledged. Such a stream must not be resumed — the
+// peer has already forgotten it, and it may still hold data to be read.
+func (s *Stream) Finished() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed || s.finishedLocked()
+}
+
+// finishedLocked reports whether the stream has nothing left to carry.
+func (s *Stream) finishedLocked() bool {
+	recvDone := s.peerFin && s.recvOff == s.peerFinOff
+	sendDone := s.writeClosed && s.finSent && s.sendBase >= s.finOff
+	return recvDone && sendDone
+}
+
+// Closing reports whether the application has let this stream go, so a
+// failure to keep it running is of no consequence to anyone.
+func (s *Stream) Closing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closing || s.closed
+}
+
+// PeerGone ends the stream as if the peer had closed it: data already
+// received can still be read, Read then reports io.EOF, and writes fail.
+// Unlike Close it never discards what the application has not read yet.
+func (s *Stream) PeerGone() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.peerFin = true
+	s.peerFinOff = s.recvOff
+	s.writeClosed = true
+	s.armResumeTimerLocked()
+	s.cond.Broadcast()
+}
+
+// Stalled reports whether data has been outstanding on the current carrier
+// for longer than d without the peer acknowledging any of it. The peer
+// acknowledges receipt within ackDelay regardless of what its application
+// does, so a long silence means the carrier is black-holed or throttled to
+// nothing (censors drop packets far more often than they reset), a state TCP
+// itself takes many minutes to report.
+func (s *Stream) Stalled(d time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.carrier == nil || s.closed {
+		return false
+	}
+	return s.sentOff > s.sendBase && time.Since(s.progressAt) > d
+}
+
 // Attach starts carrying the stream over c, transmitting from peerRecvOff,
 // the offset the peer reports having received. Any previous carrier is
 // dropped. It fails if the peer asks for bytes no longer buffered.
@@ -131,8 +221,16 @@ func (s *Stream) Attach(c net.Conn, peerRecvOff uint64) error {
 	if s.closed {
 		return ErrClosed
 	}
-	if peerRecvOff < s.sendBase || peerRecvOff > s.sendBase+uint64(len(s.sendBuf)) {
-		return errors.New("rstream: peer offset outside retransmit window")
+	if peerRecvOff < s.sendBase {
+		// The peer is reporting an offset older than one it has already
+		// acknowledged, because it sampled the offset before the last
+		// acknowledgement crossed the old carrier. Everything below sendBase
+		// is known to have arrived, so transmit from there; resending it is
+		// impossible in any case, those bytes are long discarded.
+		peerRecvOff = s.sendBase
+	}
+	if peerRecvOff > s.sendBase+uint64(len(s.sendBuf)) {
+		return errors.New("rstream: peer claims bytes we never sent")
 	}
 	s.dropCarrierLocked()
 	// Everything up to peerRecvOff is acknowledged by implication.
@@ -141,8 +239,12 @@ func (s *Stream) Attach(c net.Conn, peerRecvOff uint64) error {
 	s.gen++
 	s.sentOff = peerRecvOff
 	s.finSent = false
-	s.lastAcked = 0 // resend our ACK too, so the peer can trim
-	s.scheduleAckLocked()
+	s.progressAt = time.Now()
+	// Report our offsets again on the new carrier: an ACK in flight on the
+	// old one may have been lost, and the peer's window depends on it.
+	if s.recvOff > 0 {
+		s.ackFlush = true
+	}
 	if s.resumeTimer != nil {
 		s.resumeTimer.Stop()
 		s.resumeTimer = nil
@@ -176,6 +278,12 @@ func (s *Stream) armResumeTimerLocked() {
 	if s.closed || s.carrier != nil || s.resumeTimer != nil {
 		return
 	}
+	if s.finishedLocked() {
+		// Nothing will ever need a carrier again, so losing one is not a
+		// failure. The application still has whatever it has not read, and
+		// tearing the stream down here would take it away.
+		return
+	}
 	s.resumeTimer = time.AfterFunc(s.resumeTimeout, func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -197,6 +305,13 @@ func (s *Stream) trimLocked(off uint64) {
 	}
 	s.sendBuf = s.sendBuf[n:]
 	s.sendBase += n
+	if s.sentOff < s.sendBase {
+		// An acknowledgement overtook the transmit point. This happens right
+		// after a resume: the peer told us where to restart, then an older
+		// carrier delivered an acknowledgement for bytes beyond that. They
+		// have arrived, so there is nothing left to retransmit.
+		s.sentOff = s.sendBase
+	}
 	if len(s.sendBuf) == 0 {
 		s.sendBuf = nil
 	} else if cap(s.sendBuf) > 1<<20 && len(s.sendBuf) < cap(s.sendBuf)/4 {
@@ -215,7 +330,7 @@ func (s *Stream) Write(p []byte) (int, error) {
 		if s.closed || s.writeClosed {
 			return n, s.errOr(io.ErrClosedPipe)
 		}
-		room := window - len(s.sendBuf)
+		room := window - int(s.sendBase+uint64(len(s.sendBuf))-s.peerConsumed)
 		if room <= 0 {
 			s.cond.Wait()
 			continue
@@ -241,6 +356,12 @@ func (s *Stream) Read(p []byte) (int, error) {
 			s.recvBuf = s.recvBuf[n:]
 			if len(s.recvBuf) == 0 {
 				s.recvBuf = nil
+			}
+			// Consumption opens the peer's window; tell it.
+			if s.ackReadyLocked() {
+				s.cond.Broadcast()
+			} else {
+				s.scheduleAckLocked()
 			}
 			return n, nil
 		}
@@ -362,7 +483,7 @@ func (s *Stream) errOr(def error) error {
 // writeLoop transmits pending data, ACKs and FIN on carrier c while gen is
 // current.
 func (s *Stream) writeLoop(c net.Conn, gen int) {
-	var hdr [hdrLen + 2]byte
+	var hdr [ackLen]byte
 	for {
 		s.mu.Lock()
 		for {
@@ -386,14 +507,17 @@ func (s *Stream) writeLoop(c net.Conn, gen int) {
 		switch {
 		case s.ackReadyLocked():
 			hdr[0] = frameAck
+			cons := s.consumedLocked()
 			binary.BigEndian.PutUint64(hdr[1:], s.recvOff)
+			binary.BigEndian.PutUint64(hdr[hdrLen:], cons)
 			s.lastAcked = s.recvOff
+			s.lastCons = cons
 			s.ackFlush = false
 			if s.ackTimer != nil {
 				s.ackTimer.Stop()
 				s.ackTimer = nil
 			}
-			frame = append([]byte(nil), hdr[:hdrLen]...)
+			frame = append([]byte(nil), hdr[:ackLen]...)
 		case s.sentOff < s.sendBase+uint64(len(s.sendBuf)):
 			start := s.sentOff - s.sendBase
 			n := uint64(len(s.sendBuf)) - start
@@ -406,6 +530,9 @@ func (s *Stream) writeLoop(c net.Conn, gen int) {
 			frame = make([]byte, 0, hdrLen+2+int(n))
 			frame = append(frame, hdr[:hdrLen+2]...)
 			frame = append(frame, s.sendBuf[start:start+n]...)
+			if s.sentOff == s.sendBase {
+				s.progressAt = time.Now() // nothing was outstanding until now
+			}
 			s.sentOff += n
 		default: // FIN
 			hdr[0] = frameFin
@@ -421,18 +548,24 @@ func (s *Stream) writeLoop(c net.Conn, gen int) {
 	}
 }
 
+// consumedLocked is how far the application has read. After Close nothing
+// will ever be read, so everything received counts as consumed.
+func (s *Stream) consumedLocked() uint64 {
+	return s.recvOff - uint64(len(s.recvBuf))
+}
+
 // ackReadyLocked reports whether an ACK should go out now: a large amount
-// of unacknowledged data, or the delayed-ACK timer fired.
+// of unreported progress, or the delayed-ACK timer fired.
 func (s *Stream) ackReadyLocked() bool {
-	if s.recvOff <= s.lastAcked {
-		return false
+	if s.ackFlush {
+		return true
 	}
-	return s.recvOff-s.lastAcked >= ackEvery || s.ackFlush
+	return s.recvOff-s.lastAcked >= ackEvery || s.consumedLocked()-s.lastCons >= ackEvery
 }
 
 // scheduleAckLocked arms the delayed-ACK timer for the tail of a burst.
 func (s *Stream) scheduleAckLocked() {
-	if s.ackTimer != nil || s.recvOff <= s.lastAcked || s.closed {
+	if s.ackTimer != nil || s.closed || (s.recvOff == s.lastAcked && s.consumedLocked() == s.lastCons) {
 		return
 	}
 	s.ackTimer = time.AfterFunc(ackDelay, func() {
@@ -446,8 +579,8 @@ func (s *Stream) scheduleAckLocked() {
 
 // readLoop receives frames from carrier c while gen is current.
 func (s *Stream) readLoop(c net.Conn, gen int) {
-	var hdr [hdrLen + 2]byte
-	payload := make([]byte, maxPayload)
+	var hdr [ackLen]byte
+	payload := make([]byte, 1<<16)
 	for {
 		if _, err := io.ReadFull(c, hdr[:hdrLen]); err != nil {
 			s.carrierLost(c, gen)
@@ -456,7 +589,7 @@ func (s *Stream) readLoop(c net.Conn, gen int) {
 		off := binary.BigEndian.Uint64(hdr[1:])
 		switch hdr[0] {
 		case frameData:
-			if _, err := io.ReadFull(c, hdr[hdrLen:]); err != nil {
+			if _, err := io.ReadFull(c, hdr[hdrLen:hdrLen+2]); err != nil {
 				s.carrierLost(c, gen)
 				return
 			}
@@ -481,6 +614,12 @@ func (s *Stream) readLoop(c net.Conn, gen int) {
 			default:
 				fresh := payload[s.recvOff-off : n]
 				if !s.readClosed {
+					if len(s.recvBuf)+len(fresh) > 2*window {
+						// The peer ignored the window; never buffer without bound.
+						s.failLocked(errProtocol)
+						s.mu.Unlock()
+						return
+					}
 					s.recvBuf = append(s.recvBuf, fresh...)
 				}
 				s.recvOff = end
@@ -492,9 +631,21 @@ func (s *Stream) readLoop(c net.Conn, gen int) {
 			}
 			s.mu.Unlock()
 		case frameAck:
+			if _, err := io.ReadFull(c, hdr[hdrLen:ackLen]); err != nil {
+				s.carrierLost(c, gen)
+				return
+			}
+			cons := binary.BigEndian.Uint64(hdr[hdrLen:])
 			s.mu.Lock()
 			if s.gen == gen {
+				if off > s.sendBase {
+					s.progressAt = time.Now()
+				}
 				s.trimLocked(off)
+				if cons > s.peerConsumed && cons <= s.sendBase+uint64(len(s.sendBuf)) {
+					s.peerConsumed = cons
+					s.cond.Broadcast()
+				}
 				s.maybeFinishLocked()
 			}
 			s.mu.Unlock()
@@ -530,6 +681,9 @@ func (s *Stream) carrierLost(c net.Conn, gen int) {
 	s.dropCarrierLocked()
 	s.armResumeTimerLocked()
 	s.cond.Broadcast()
+	if s.onCarrierLost != nil && !s.closed {
+		go s.onCarrierLost()
+	}
 }
 
 // Attached reports whether a carrier is currently attached.

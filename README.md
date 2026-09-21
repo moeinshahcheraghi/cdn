@@ -24,7 +24,14 @@ active probing را خنثی می‌کند. محدودیت پهنای‌باند
 | Long-flow keepalive fingerprint | no application-layer keepalive; liveness is kernel TCP keepalive, and idle sessions are retired |
 | Unknown domain on a datacenter IP | **REALITY mode**: SNI and certificate of a big allowed site; probes are spliced to the real site and see its genuine chain; no domain/cert of your own |
 | Long, high-volume flows throttled or flagged | **rotating carriers**: every TLS connection is retired after a random few minutes / few hundred MB and user streams continue seamlessly on a fresh one (resumable streams) |
-| One exit IP carrying everything | `servers`: several exits, each connection picks one at random |
+| A flow silently throttled to nothing, or dropped without a reset | unacknowledged data is noticed within seconds and the connection replaced; the kernel would take ~90 s |
+| One exit IP carrying everything | `servers`: several exits and ports, chosen at random, with automatic failover and background recovery |
+| The exit IP blocked outright, or unreachable from one datacenter | `backups`: alternative routes, in particular **a WebSocket through a CDN** — the censored link then sees only Cloudflare's IPs and certificate |
+| Per-flow throttling of a single heavy connection | users are spread over `pool` connections before any is stacked up |
+
+All of it is transparent to the user: a connection that is moved, replaced or
+rerouted continues from the exact byte the far end received, so an OpenVPN
+session survives hundreds of rotations and the loss of a whole route.
 
 The wire format follows the Trojan idea: after the TLS handshake, a client sends
 a 56-byte SHA-224 password digest; a peer that does not is indistinguishable from
@@ -339,6 +346,43 @@ Anyone connecting without the key is transparently spliced to the real site
 and receives its real certificate. Keep both clocks NTP-synced.
 `deploy/reality-openvpn/` has a complete pair of configs with a Persian guide.
 
+## Through a CDN (when the exit IP is blocked)
+
+When a datacenter cannot reach the exit at all, or its IP has been burned,
+the tunnel can travel inside an ordinary WebSocket through a CDN. The
+censored link then carries HTTPS to Cloudflare's addresses with Cloudflare's
+certificate, and the exit's own address never appears on it.
+
+Server — a second door, since a REALITY port cannot also serve a CDN:
+
+```json
+"ws": { "path": "/live/stream/5f3c1a9e", "listen": ":8443" }
+```
+
+Client — usually as a backup, so the direct route is preferred while it works:
+
+```json
+"backups": [{ "server": "cdn.example.com:443", "sni": "cdn.example.com",
+              "ws": { "path": "/live/stream/5f3c1a9e" } }]
+```
+
+In Cloudflare: an A record for that name at the exit IP, proxied (orange
+cloud), SSL mode Full, WebSockets on. `path` is a second secret; every other
+path on the port is served by the fallback site, so scanning finds nothing.
+
+## Routes and failover
+
+`server`, `servers` and `backups` together describe every way to reach the
+exit. Each connection picks a random healthy route, preferring the primary
+tier; a route that fails is set aside with exponential backoff and re-tested
+in the background, so neither a blocked IP nor its recovery costs users more
+than a single slow attempt. Established streams are moved onto whatever route
+works. `tunnel-client -diag` reports every route stage by stage.
+
+A REALITY handshake is also rejected outright when the client's clock is
+wrong, which looks exactly like being blocked. The client measures the true
+time against the imitated site, compensates, and says so in the log.
+
 ## Rotating carriers
 
 With `mux` on, each TLS connection lives at most `rotate_seconds` (default
@@ -348,12 +392,23 @@ continues every stream on a fresh connection from the exact byte the server
 last received, so an OpenVPN session survives hundreds of rotations. Set a
 value to 0 to disable that dimension.
 
+The same machinery covers failure, not just rotation. A connection that is
+reset, or that stops delivering data while appearing alive, is detected
+(within `stallTimeout`, 15 s, rather than the kernel's ~90 s) and its streams
+are moved. A move is prove-then-swap: the new connection is adopted only once
+the server has confirmed the stream over it, so a failed attempt costs
+nothing and the user keeps running on the old one. A stream whose header
+never reached the server is simply opened again. Nothing the application has
+written or read is ever lost or duplicated.
+
 ## Diagnostics
 
-`tunnel-client -c client.json -diag` tests TCP connect, the handshake with
-every browser fingerprint (and prints each ClientHello's size, since hellos
-over one packet are dropped by some censors), and finally opens a real tunnel
-stream, so a failing site can be classified in seconds.
+`tunnel-client -c client.json -diag` tests every configured route in turn:
+TCP connect, the handshake with each browser fingerprint (printing each
+ClientHello's size, since hellos over one packet are dropped by some
+censors), the clock against the imitated site in REALITY mode, and finally a
+real tunnel stream. A failing datacenter is classified in seconds — blocked
+IP, blocked port, wrong SNI or fingerprint, wrong clock, or wrong password.
 
 ## Putting OpenVPN (or any TCP service) behind the tunnel
 
@@ -393,8 +448,13 @@ imitated site in REALITY mode), `reality`, `servers`, `forwards`,
 
 - Current build tunnels TCP (CONNECT). UDP-associate is not yet implemented, so
   QUIC/HTTP3 and some game/VoIP UDP will fall back to TCP in the browser.
-- `fingerprint: chrome` (the default) is the safest choice. `random` builds a
-  ClientHello no real browser sends and should only be used for experiments.
+- Flow control is end-to-end: a user who stops reading blocks their own
+  writer instead of making the relay buffer without bound, so one slow client
+  cannot add latency for everyone or exhaust the relay's memory.
+- `fingerprint: firefox` (the default) is the safest choice: Chrome's
+  post-quantum ClientHello spans two packets and Iran's DPI drops it.
+  `random` builds a ClientHello no real browser sends and should only be used
+  for experiments.
 - smux is vendored under `third_party/` with one bug fix (see its `PATCH.md`):
   upstream discards unread received data when a multiplexed stream is
   half-closed, which truncated transfers. Keep the `replace` directive.

@@ -5,3 +5,4 @@ client.json
 *.pem
 /server
 /client
+/release/

@@ -1,6 +1,10 @@
 {
   // host:port of your server.
   "server": "your-domain.example:443",
+  // Several addresses may be given instead: each connection picks one at
+  // random and a failing one is set aside and retried in the background, so
+  // more than one exit IP (or port) carries the traffic.
+  // "servers": ["1.2.3.4:443", "1.2.3.4:8880", "5.6.7.8:443"],
   "password": "change-me-to-a-long-random-secret",
   // SNI to present; must match the server certificate's domain.
   "sni": "your-domain.example",
@@ -10,6 +14,23 @@
   // Iran) drop the split ClientHello, causing handshake timeouts. firefox/safari
   // fit in one packet.
   "fingerprint": "firefox",
+  // REALITY, when public_key is set: the server borrows a big site's identity
+  // and "server" may be a bare IP. "sni" must then be one of its server_names.
+  // "reality": { "public_key": "FROM_SERVER_KEYGEN", "short_id": "a1b2c3d4" },
+  //
+  // Carry the tunnel inside a WebSocket, which is how it passes through a CDN
+  // (Cloudflare): "server"/"sni" are then your CDN-proxied domain and "path"
+  // must match the server's ws.path.
+  // "ws": { "path": "/live/stream/5f3c1a9e" },
+  //
+  // Alternative routes, used only while the route above is failing, and
+  // dropped again the moment it recovers. A CDN backup survives the exit IP
+  // being blocked outright.
+  // "backups": [
+  //   { "server": "cdn.example.com:443", "sni": "cdn.example.com",
+  //     "ws": { "path": "/live/stream/5f3c1a9e" } }
+  // ],
+  //
   // Local proxies. Point your browser/system at either.
   "socks_listen": "127.0.0.1:1080",
   "http_listen": "127.0.0.1:1081",
@@ -19,7 +40,13 @@
   //   "forwards": [{ "listen": "0.0.0.0:2083", "target": "127.0.0.1:1194" }]
   "forwards": [],
   // Multiplex many streams over few TLS connections for low latency.
-  "mux": { "enabled": true, "concurrency": 8, "pool": 4 },
+  // "pool" connections are opened before streams are stacked up, since on a
+  // policed international path throughput follows the number of flows and one
+  // flow's loss then stalls only the users sharing it. rotate_seconds and
+  // rotate_mb retire each connection after at most that age or traffic (a
+  // random 50-100% of each) and move its streams to a fresh one, unnoticed.
+  "mux": { "enabled": true, "concurrency": 8, "pool": 4,
+           "rotate_seconds": 300, "rotate_mb": 256 },
   // Set true only with a self-signed server cert.
   "allow_insecure": false,
   "log": "info"

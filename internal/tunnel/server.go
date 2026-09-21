@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/subtle"
@@ -8,6 +9,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/moeinshah0/tunnel/internal/relay"
 	"github.com/moeinshah0/tunnel/internal/rstream"
 	"github.com/moeinshah0/tunnel/internal/transport"
+	"github.com/moeinshah0/tunnel/internal/wsconn"
 	"github.com/xtaci/smux"
 	"github.com/xtls/reality"
 )
@@ -32,8 +35,10 @@ const authTimeout = 30 * time.Second
 const dialTimeout = 15 * time.Second
 
 // resumeTimeout is how long a resumable stream survives without a carrier,
-// waiting for the client to continue it over a new connection.
-const resumeTimeout = 45 * time.Second
+// waiting for the client to continue it over a new connection. It is generous
+// because a client whose connection just died may need several attempts over
+// a bad link, and losing the stream means dropping the user's session.
+const resumeTimeout = 3 * time.Minute
 
 // Server terminates TLS, authenticates clients, and relays their streams.
 type Server struct {
@@ -41,14 +46,41 @@ type Server struct {
 	reality   *reality.Config // when set, REALITY replaces tlsConfig
 	hashes    [][]byte        // accepted password digests
 	fallback  *fallback.Handler
+	wsPath    string // when set, a WebSocket upgrade to this path is a carrier
 
-	// streams holds live resumable streams by id, across carriers.
-	smu     sync.Mutex
-	streams map[uint64]*rstream.Stream
+	// streams holds live resumable streams by id, across carriers — and
+	// across listeners, so a stream opened on the main port can be resumed
+	// through the CDN door when the direct route stops working.
+	streams *streamTable
+}
+
+// streamTable is the registry of live resumable streams.
+type streamTable struct {
+	mu sync.Mutex
+	m  map[uint64]*rstream.Stream
 }
 
 // SetReality switches the server to REALITY mode.
 func (s *Server) SetReality(cfg *reality.Config) { s.reality = cfg }
+
+// SetWebSocketPath accepts the tunnel inside a WebSocket upgrade to path, so
+// clients can reach the server through a CDN. Every other request, and every
+// other path, is still served by the fallback site.
+func (s *Server) SetWebSocketPath(path string) { s.wsPath = path }
+
+// CertHandler returns a view of this server that terminates ordinary
+// certificate TLS instead of REALITY, for a second port a CDN connects to.
+// Resumable streams are shared with the main listener, so a stream may be
+// resumed over whichever door is reachable at the time.
+func (s *Server) CertHandler() *Server {
+	return &Server{
+		tlsConfig: s.tlsConfig,
+		hashes:    s.hashes,
+		fallback:  s.fallback,
+		wsPath:    s.wsPath,
+		streams:   s.streams,
+	}
+}
 
 // NewServer builds a Server from a TLS config, accepted passwords, and origin.
 func NewServer(tlsConfig *tls.Config, passwords []string, fb *fallback.Handler) *Server {
@@ -56,7 +88,8 @@ func NewServer(tlsConfig *tls.Config, passwords []string, fb *fallback.Handler) 
 	for i, p := range passwords {
 		hashes[i] = []byte(protocol.HashPassword(p))
 	}
-	return &Server{tlsConfig: tlsConfig, hashes: hashes, fallback: fb, streams: map[uint64]*rstream.Stream{}}
+	return &Server{tlsConfig: tlsConfig, hashes: hashes, fallback: fb,
+		streams: &streamTable{m: map[uint64]*rstream.Stream{}}}
 }
 
 // Handle processes one accepted TCP connection end to end.
@@ -94,6 +127,12 @@ func (s *Server) Handle(raw net.Conn) {
 		}
 		conn = tc
 	}
+	s.serveDecrypted(conn)
+}
+
+// serveDecrypted authenticates and serves one connection whose encryption
+// layer is already established.
+func (s *Server) serveDecrypted(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(authTimeout))
 
 	// Read the client's first record with a single Read rather than
@@ -104,7 +143,16 @@ func (s *Server) Handle(raw net.Conn) {
 	// is judged immediately and replayed verbatim to the fallback origin.
 	prefix := make([]byte, protocol.HashLen)
 	n, err := conn.Read(prefix)
-	if err != nil || !s.authorized(prefix[:n]) {
+	if err != nil {
+		_ = conn.SetDeadline(time.Time{})
+		s.fallback.Serve(conn, prefix[:n])
+		return
+	}
+	if s.wsPath != "" && looksHTTP(prefix[:n]) {
+		s.serveWebSocket(conn, prefix[:n])
+		return
+	}
+	if !s.authorized(prefix[:n]) {
 		_ = conn.SetDeadline(time.Time{})
 		s.fallback.Serve(conn, prefix[:n])
 		return
@@ -141,6 +189,68 @@ func (s *Server) Handle(raw net.Conn) {
 		logx.Debugf("server: unsupported command 0x%02x", byte(meta.Command))
 		conn.Close()
 	}
+}
+
+// looksHTTP reports whether b starts like an HTTP request line, which is
+// what a WebSocket upgrade (or a probe with a browser) begins with.
+func looksHTTP(b []byte) bool {
+	return bytes.HasPrefix(b, []byte("GET ")) || bytes.HasPrefix(b, []byte("HEAD ")) ||
+		bytes.HasPrefix(b, []byte("POST ")) || bytes.HasPrefix(b, []byte("OPTI"))
+}
+
+// serveWebSocket handles an HTTP request that arrived instead of a digest.
+// A WebSocket upgrade to the secret path becomes a tunnel carrier; anything
+// else is a visitor (or a probe) and goes to the fallback site untouched,
+// bytes and all, so the port is a plain website to everyone but us.
+func (s *Server) serveWebSocket(conn net.Conn, prefix []byte) {
+	// seen records the bytes read, so a visitor can be handed to the
+	// fallback untouched. Recording stops once the request is judged: an
+	// accepted carrier must not copy its whole life into memory.
+	rec := &recorder{}
+	rec.buf.Write(prefix)
+	br := bufio.NewReaderSize(io.TeeReader(conn, rec), 32*1024)
+	// The request line already read is replayed ahead of the rest.
+	full := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(prefix), br), 32*1024)
+	req, err := http.ReadRequest(full)
+	if err != nil || req.URL.Path != s.wsPath || !wsconn.IsUpgrade(req) {
+		_ = conn.SetDeadline(time.Time{})
+		s.fallback.Serve(conn, rec.stop())
+		return
+	}
+	rec.stop()
+	ws, err := wsconn.Accept(conn, full, req)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	logx.Debugf("server: websocket carrier from %s", conn.RemoteAddr())
+	s.serveDecrypted(ws)
+}
+
+// recorder is a Writer that keeps what it is given until stopped.
+type recorder struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	stopped bool
+}
+
+func (r *recorder) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	if !r.stopped {
+		r.buf.Write(p)
+	}
+	r.mu.Unlock()
+	return len(p), nil
+}
+
+// stop ends recording and returns what was recorded.
+func (r *recorder) stop() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stopped = true
+	b := r.buf.Bytes()
+	r.buf = bytes.Buffer{}
+	return b
 }
 
 // authorized reports whether prefix matches any accepted digest, in constant
@@ -217,18 +327,19 @@ func (s *Server) serveMuxStream(stream *smux.Stream) {
 // newStream registers a resumable stream that unregisters itself on close.
 func (s *Server) newStream(id uint64) *rstream.Stream {
 	rs := rstream.New(id, resumeTimeout)
-	s.smu.Lock()
-	if old := s.streams[id]; old != nil {
+	t := s.streams
+	t.mu.Lock()
+	if old := t.m[id]; old != nil {
 		old.Close()
 	}
-	s.streams[id] = rs
-	s.smu.Unlock()
+	t.m[id] = rs
+	t.mu.Unlock()
 	rs.SetOnClose(func() {
-		s.smu.Lock()
-		if s.streams[id] == rs {
-			delete(s.streams, id)
+		t.mu.Lock()
+		if t.m[id] == rs {
+			delete(t.m, id)
 		}
-		s.smu.Unlock()
+		t.mu.Unlock()
 	})
 	return rs
 }
@@ -236,9 +347,9 @@ func (s *Server) newStream(id uint64) *rstream.Stream {
 // resume continues stream id over carrier, replying with our received
 // offset so the client can retransmit exactly what was lost.
 func (s *Server) resume(carrier net.Conn, id, clientRecvOff uint64) {
-	s.smu.Lock()
-	rs := s.streams[id]
-	s.smu.Unlock()
+	s.streams.mu.Lock()
+	rs := s.streams.m[id]
+	s.streams.mu.Unlock()
 	var reply [9]byte
 	if rs == nil {
 		reply[0] = 1
@@ -247,7 +358,11 @@ func (s *Server) resume(carrier net.Conn, id, clientRecvOff uint64) {
 		logx.Debugf("server: resume of unknown stream %x", id)
 		return
 	}
-	rs.Detach() // freeze our receive offset before reporting it
+	// Report our offset without detaching: if this resume does not complete,
+	// the stream must keep running on whatever carrier it still has. Attach
+	// below performs the swap atomically. A few bytes may arrive on the old
+	// carrier in between, which only makes the client resend what we already
+	// have, and duplicates are dropped by offset.
 	reply[0] = protocol.ResumeOK
 	binary.BigEndian.PutUint64(reply[1:], rs.RecvOffset())
 	if _, err := carrier.Write(reply[:]); err != nil {
@@ -257,7 +372,6 @@ func (s *Server) resume(carrier net.Conn, id, clientRecvOff uint64) {
 	if err := rs.Attach(carrier, clientRecvOff); err != nil {
 		logx.Debugf("server: resume %x: %v", id, err)
 		carrier.Close()
-		rs.Close()
 		return
 	}
 	logx.Debugf("server: resumed stream %x at %d", id, clientRecvOff)

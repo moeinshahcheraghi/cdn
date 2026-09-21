@@ -1,5 +1,7 @@
 {
   // Public listen address. Use :443 in production to blend with HTTPS.
+  // Several ports may be listed (":443,:8880,:2053"): if a censor blocks one
+  // port on this IP, clients carry on over another with no redeployment.
   "listen": ":443",
   // Any client presenting one of these passwords is authenticated.
   "passwords": ["change-me-to-a-long-random-secret"],
@@ -17,6 +19,27 @@
   // empty (and acme.domain empty) to auto self-sign (testing only; weaker cover).
   "tls_cert": "",
   "tls_key": "",
+  // REALITY: borrow a real site's identity instead of having a domain and a
+  // certificate of your own. Generate keys with: tunnel-server -keygen
+  // Anyone without the key is spliced to the real site and sees its genuine
+  // certificate, so there is nothing to discover. Leave "dest" empty to use
+  // ordinary certificate TLS above instead.
+  "reality": {
+    "dest": "",
+    "server_names": [],
+    "private_key": "",
+    "short_ids": [],
+    "max_time_diff": 120
+  },
+  // Accept the tunnel inside a WebSocket upgrade, so clients can reach this
+  // server through a CDN when its own IP is blocked or unreachable. "path" is
+  // a second secret: every other path on the port is served by the fallback
+  // site. "listen" is an extra certificate-TLS port for the CDN to connect to
+  // (required in REALITY mode, whose main port cannot serve a CDN).
+  "ws": {
+    "path": "",
+    "listen": ""
+  },
   // A real HTTP(S) origin shown to anyone who fails auth (defeats active
   // probing). Point at a local site, or use a real public HTTPS site on :443
   // (dialed over TLS automatically) so no local web server is needed.

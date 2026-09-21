@@ -28,7 +28,7 @@ type testEnv struct {
 	server, echo, banner string
 }
 
-func startEnv(t *testing.T) *testEnv {
+func startEnv(t *testing.T, opts ...func(*Server)) *testEnv {
 	t.Helper()
 	echo := listen(t)
 	go serveEach(echo, func(c net.Conn) { io.Copy(c, c) })
@@ -49,6 +49,9 @@ func startEnv(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 	srv := NewServer(tlsCfg, []string{testPassword}, fallback.New(origin.Addr().String()))
+	for _, o := range opts {
+		o(srv)
+	}
 	ln := listen(t)
 	go serveEach(ln, srv.Handle)
 

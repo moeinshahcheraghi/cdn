@@ -25,36 +25,26 @@ func HelloSize(fp, sni string) int {
 	return len(u.HandshakeState.Hello.Raw) + 5
 }
 
-// Probe measures one server: TCP connect and the TLS/REALITY handshake with
-// the given fingerprint. It returns durations for each stage and an error for
-// the first stage that failed.
-func (d *Dialer) Probe(ctx context.Context, server, fp string) (tcp, tls time.Duration, err error) {
-	dd := *d
-	dd.Server = server
-	dd.Servers = nil
-	dd.Fingerprint = fp
+// Probe measures one endpoint: TCP connect, then the full handshake (TLS,
+// REALITY or WebSocket) with fingerprint fp. It returns the duration of each
+// stage and an error for the first stage that failed.
+func (d *Dialer) Probe(ctx context.Context, ep *Endpoint, fp string) (tcp, hs time.Duration, err error) {
 	t0 := time.Now()
-	raw, err := dd.tcp.DialContext(ctx, "tcp", server)
+	raw, err := d.tcp.DialContext(ctx, "tcp", ep.Server)
 	if err != nil {
 		return time.Since(t0), 0, err
 	}
 	tcp = time.Since(t0)
-	_ = raw.(*net.TCPConn).SetNoDelay(true)
-	_ = raw.SetDeadline(time.Now().Add(10 * time.Second))
+	defer raw.Close()
 	t1 := time.Now()
-	var conn net.Conn
-	if dd.Reality != nil {
-		conn, err = dd.realityDial(ctx, raw)
-	} else {
-		u := utls.UClient(raw, &utls.Config{ServerName: dd.SNI, InsecureSkipVerify: dd.AllowInsecure, NextProtos: []string{"h2", "http/1.1"}}, clientHelloID(fp))
-		err = u.HandshakeContext(ctx)
-		conn = u
-	}
-	tls = time.Since(t1)
+	conn, err := d.handshake(ctx, raw, ep, fp)
+	hs = time.Since(t1)
 	if err != nil {
-		raw.Close()
-		return tcp, tls, err
+		return tcp, hs, err
 	}
 	conn.Close()
-	return tcp, tls, nil
+	return tcp, hs, nil
 }
+
+// TCPDialer exposes the dialer's TCP settings for diagnostics.
+func (d *Dialer) TCPDialer() *net.Dialer { return &d.tcp }

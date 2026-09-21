@@ -17,9 +17,9 @@ import (
 // Long-lived streams (an OpenVPN user) must survive many carrier rotations
 // with continuous bidirectional traffic and no corruption.
 func TestRotationKeepsStreamsAlive(t *testing.T) {
-	old := rotateTick
-	rotateTick = 100 * time.Millisecond
-	t.Cleanup(func() { rotateTick = old })
+	old := rotateTick.get()
+	rotateTick.set(100 * time.Millisecond)
+	t.Cleanup(func() { rotateTick.set(old) })
 
 	logx.SetLevel("debug")
 	t.Cleanup(func() { logx.SetLevel("info") })
@@ -27,7 +27,7 @@ func TestRotationKeepsStreamsAlive(t *testing.T) {
 	cfg := &config.ClientConfig{
 		Server: env.server, Password: testPassword, SNI: "localhost",
 		Fingerprint: "firefox", AllowInsecure: true,
-		Mux: config.MuxConfig{Enabled: true, Concurrency: 4, Pool: 4, RotateSeconds: 1, RotateMB: 20},
+		Mux: config.MuxConfig{Enabled: true, Concurrency: 4, Pool: 4, RotateSeconds: 1, RotateMB: 6},
 	}
 	c := NewClient(cfg)
 	t.Cleanup(c.Close)
@@ -48,7 +48,7 @@ func TestRotationKeepsStreamsAlive(t *testing.T) {
 				return
 			}
 			defer stream.Close()
-			payload := make([]byte, 24<<20)
+			payload := make([]byte, 8<<20)
 			rand.Read(payload)
 			go func() {
 				// Trickle then bulk, so both idle-ish and busy phases rotate.

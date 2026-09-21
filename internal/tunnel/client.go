@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -30,8 +31,39 @@ const idleTimeout = 4 * time.Minute
 // of going out as a separate tiny record.
 const headerGrace = 30 * time.Millisecond
 
-// rotateTick is how often sessions are checked for retirement.
-var rotateTick = 5 * time.Second
+// rotateTick is how often sessions are checked for retirement and streams
+// for a lost or stalled carrier. A lost carrier also triggers a check at once.
+var rotateTick = newTunable(2 * time.Second)
+
+// stallTimeout is how long a stream's data may go unacknowledged before its
+// connection is declared dead and the stream is moved. Acknowledgements
+// normally arrive within a round trip, so this only fires on a flow the
+// network has black-holed or throttled to a crawl.
+var stallTimeout = newTunable(15 * time.Second)
+
+// tunable is a duration a test may change while clients are running, so the
+// change cannot race their rotate goroutines.
+type tunable struct{ v atomic.Int64 }
+
+func newTunable(d time.Duration) *tunable {
+	t := &tunable{}
+	t.set(d)
+	return t
+}
+
+func (t *tunable) get() time.Duration  { return time.Duration(t.v.Load()) }
+func (t *tunable) set(d time.Duration) { t.v.Store(int64(d)) }
+
+// migrateParallel bounds concurrent stream moves, e.g. after a connection
+// carrying many users is reset.
+const migrateParallel = 8
+
+// resumeReplyTimeout bounds waiting for the server to confirm a resume.
+const resumeReplyTimeout = 10 * time.Second
+
+// migrateBackoff is how long to wait before retrying a stream whose move
+// failed, so a server that is briefly unreachable is not hammered.
+const migrateBackoff = 2 * time.Second
 
 // Client opens tunneled streams to the server for each inbound request.
 type Client struct {
@@ -39,14 +71,25 @@ type Client struct {
 	authHash string
 	mux      config.MuxConfig
 
-	mu       sync.Mutex
-	sessions []*muxSession
-	streams  map[*rstream.Stream]*muxSession // live resumable streams
-	closed   bool
+	mu        sync.Mutex
+	sessions  []*muxSession
+	streams   map[*rstream.Stream]*streamRef // live resumable streams
+	migrating map[*rstream.Stream]bool
+	closed    bool
+	kick      chan struct{} // wakes rotate early
 
 	// dialMu serializes creation of new sessions so a burst of requests on a
 	// cold or saturated pool does not open dozens of TLS handshakes at once.
 	dialMu sync.Mutex
+}
+
+// streamRef is what the client remembers about a live resumable stream: the
+// session carrying it and where it was going, so it can be moved — or, if
+// nothing has crossed it yet, opened again from scratch.
+type streamRef struct {
+	sess    *muxSession
+	target  protocol.Address
+	nextTry time.Time // set after a failed move, to back off
 }
 
 // muxSession is a pooled smux session plus its rotation state.
@@ -58,6 +101,7 @@ type muxSession struct {
 	maxBytes  int64         // 0 = unlimited
 	bytes     *atomic.Int64
 	retired   bool // no new streams; existing ones are being moved away
+	ep        *transport.Endpoint
 }
 
 // countConn counts bytes in both directions on a carrier connection.
@@ -80,16 +124,13 @@ func (c countConn) Write(p []byte) (int, error) {
 
 // NewClient constructs a tunnel client from validated config.
 func NewClient(c *config.ClientConfig) *Client {
-	dialer := transport.NewDialer(c.Server, c.SNI, c.Fingerprint, c.AllowInsecure)
-	dialer.Servers = c.Servers
-	if c.Reality.PublicKey != "" {
-		dialer.Reality = &transport.RealityClient{PublicKey: c.Reality.PublicKey, ShortID: c.Reality.ShortID}
-	}
 	cl := &Client{
-		dialer:   dialer,
-		authHash: protocol.HashPassword(c.Password),
-		mux:      c.Mux,
-		streams:  map[*rstream.Stream]*muxSession{},
+		dialer:    transport.NewDialer(Endpoints(c)),
+		authHash:  protocol.HashPassword(c.Password),
+		mux:       c.Mux,
+		streams:   map[*rstream.Stream]*streamRef{},
+		migrating: map[*rstream.Stream]bool{},
+		kick:      make(chan struct{}, 1),
 	}
 	if c.Mux.Enabled {
 		go cl.reapIdle()
@@ -97,6 +138,35 @@ func NewClient(c *config.ClientConfig) *Client {
 	}
 	return cl
 }
+
+// Endpoints lists every route the config describes: the primary server(s)
+// as tier 0 and each backup as tier 1.
+func Endpoints(c *config.ClientConfig) []transport.Endpoint {
+	var eps []transport.Endpoint
+	add := func(tier int, server string, servers []string, sni, fp string, r config.RealityClientConfig, ws config.WSClientConfig, insecure bool) {
+		if len(servers) == 0 {
+			servers = []string{server}
+		}
+		for _, srv := range servers {
+			ep := transport.Endpoint{Server: srv, SNI: sni, Fingerprint: fp, AllowInsecure: insecure, Tier: tier}
+			if r.PublicKey != "" {
+				ep.Reality = &transport.RealityClient{PublicKey: r.PublicKey, ShortID: r.ShortID}
+			}
+			if ws.Path != "" {
+				ep.WS = &transport.WSClient{Path: ws.Path, Host: ws.Host}
+			}
+			eps = append(eps, ep)
+		}
+	}
+	add(0, c.Server, c.Servers, c.SNI, c.Fingerprint, c.Reality, c.WS, c.AllowInsecure)
+	for _, b := range c.Backups {
+		add(1, b.Server, b.Servers, b.SNI, b.Fingerprint, b.Reality, b.WS, b.AllowInsecure)
+	}
+	return eps
+}
+
+// Dialer exposes the underlying dialer for diagnostics.
+func (c *Client) Dialer() *transport.Dialer { return c.dialer }
 
 // Warm dials one mux session ahead of the first request so it does not pay
 // the TCP+TLS round trips. Failures are logged, not fatal.
@@ -147,24 +217,31 @@ func (c *Client) openMuxStream(ctx context.Context, target protocol.Address) (ne
 		return nil, err
 	}
 	id := rand.Uint64()
-	// Per-stream metadata carries no password; the session is already
-	// authed. It is sent lazily, merged with the application's first bytes.
-	hdr := protocol.Metadata{Command: protocol.CmdConnectR, Address: target}.AppendTo(make([]byte, 0, 4096))
-	hdr = binary.BigEndian.AppendUint64(hdr, id)
 	rs := rstream.New(id, resumeTimeout)
 	c.mu.Lock()
-	c.streams[rs] = sess
+	c.streams[rs] = &streamRef{sess: sess, target: target}
 	c.mu.Unlock()
 	rs.SetOnClose(func() {
 		c.mu.Lock()
 		delete(c.streams, rs)
 		c.mu.Unlock()
 	})
-	if err := rs.Attach(newHeaderConn(stream, hdr), 0); err != nil {
+	// A connection reset by the network must not cost the user anything:
+	// resume on another connection right away.
+	rs.SetOnCarrierLost(c.wake)
+	if err := rs.Attach(newHeaderConn(stream, connectHeader(target, id)), 0); err != nil {
 		rs.Close()
 		return nil, err
 	}
 	return rs, nil
+}
+
+// connectHeader is the per-stream metadata: no password, since the session
+// is already authenticated. It is sent lazily, merged with the application's
+// first bytes, so it does not show up as a separate tiny record.
+func connectHeader(target protocol.Address, id uint64) []byte {
+	hdr := protocol.Metadata{Command: protocol.CmdConnectR, Address: target}.AppendTo(make([]byte, 0, 512))
+	return binary.BigEndian.AppendUint64(hdr, id)
 }
 
 // openRaw returns a fresh smux stream on a session with capacity.
@@ -208,15 +285,21 @@ func (c *Client) acquireSession(ctx context.Context) (*muxSession, error) {
 }
 
 // selectSession picks an existing session to reuse, pruning closed ones. It
-// returns dial=true when the caller should create a new session instead: no
-// live session has spare capacity and the pool still has room to grow.
-// Retired sessions are never chosen.
+// returns dial=true when the caller should create a new session instead.
+//
+// Streams go to the least-loaded session. While the pool has room, a new
+// connection is opened as soon as every live one carries mux.concurrency
+// streams, so heavy long-lived streams (VPN users) are spread over many TCP
+// connections: on a lossy or per-flow-policed international path the total
+// throughput is roughly proportional to the number of flows, and one user's
+// loss stalls only the few users sharing that flow. Retired sessions are
+// never chosen.
 func (c *Client) selectSession() (sess *muxSession, dial bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	live := c.sessions[:0]
-	var chosen, least *muxSession
-	active := 0
+	var least *muxSession
+	leastN, active := 0, 0
 	for _, s := range c.sessions {
 		if s.IsClosed() {
 			continue
@@ -226,23 +309,18 @@ func (c *Client) selectSession() (sess *muxSession, dial bool) {
 			continue
 		}
 		active++
-		n := s.NumStreams()
-		if chosen == nil && n < c.mux.Concurrency {
-			chosen = s
-		}
-		if least == nil || n < least.NumStreams() {
-			least = s
+		if n := s.NumStreams(); least == nil || n < leastN {
+			least, leastN = s, n
 		}
 	}
 	c.sessions = live
-	if chosen != nil {
-		return chosen, false
+	if active < c.mux.Pool {
+		return nil, true // spread: grow the pool before stacking streams up
 	}
-	if active >= c.mux.Pool && least != nil {
-		// Pool is saturated; reuse the least-loaded session anyway.
+	if least != nil && leastN < c.mux.Concurrency*c.mux.Pool {
 		return least, false
 	}
-	return nil, true
+	return least, least == nil
 }
 
 // dialSession creates a new authenticated smux session over TLS.
@@ -251,6 +329,7 @@ func (c *Client) dialSession(ctx context.Context) (*muxSession, error) {
 	if err != nil {
 		return nil, err
 	}
+	ep := transport.EndpointOf(conn)
 	counter := new(atomic.Int64)
 	pc := pad.New(countConn{conn, counter})
 	dummy := protocol.NewAddress("0.0.0.0", 0)
@@ -263,7 +342,7 @@ func (c *Client) dialSession(ctx context.Context) (*muxSession, error) {
 		conn.Close()
 		return nil, fmt.Errorf("tunnel: smux client: %w", err)
 	}
-	ms := &muxSession{Session: sess, born: time.Now(), bytes: counter}
+	ms := &muxSession{Session: sess, born: time.Now(), bytes: counter, ep: ep}
 	// Each session draws its own limits from [50%, 100%] of the configured
 	// maxima, so sessions born together do not all rotate together.
 	if c.mux.RotateSeconds > 0 {
@@ -328,20 +407,35 @@ func (c *Client) reapIdle() {
 	}
 }
 
-// rotate retires sessions past their age or byte budget and moves their
-// streams to fresh sessions, so no TLS connection lives long or carries
-// much, while users never notice.
+// wake makes rotate run now rather than at its next tick.
+func (c *Client) wake() {
+	select {
+	case c.kick <- struct{}{}:
+	default:
+	}
+}
+
+// rotate keeps every stream on a healthy, young connection. It retires
+// sessions past their age or byte budget, and sessions on which a stream has
+// stalled, and moves streams off retired or dead sessions onto fresh ones, so
+// no TLS connection lives long or carries much, a connection killed or
+// black-holed by the network costs users a moment's pause instead of their
+// VPN session, and users never notice any of it.
 func (c *Client) rotate() {
-	t := time.NewTicker(rotateTick)
+	t := time.NewTicker(rotateTick.get())
 	defer t.Stop()
-	for range t.C {
+	sem := make(chan struct{}, migrateParallel)
+	for {
+		select {
+		case <-t.C:
+		case <-c.kick:
+		}
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
 			return
 		}
 		now := time.Now()
-		var moves []*rstream.Stream
 		for _, s := range c.sessions {
 			if s.IsClosed() {
 				continue
@@ -351,19 +445,56 @@ func (c *Client) rotate() {
 				logx.Debugf("client: retiring session after %s / %d MB", now.Sub(s.born).Round(time.Second), s.bytes.Load()/1e6)
 			}
 		}
-		for rs, s := range c.streams {
-			if s.retired {
-				moves = append(moves, rs)
+		var moves []*rstream.Stream
+		var stalled []*transport.Endpoint
+		for rs, ref := range c.streams {
+			s := ref.sess
+			if c.migrating[rs] || now.Before(ref.nextTry) {
+				continue
 			}
+			if !s.retired && !s.IsClosed() && rs.Stalled(stallTimeout.get()) {
+				s.retired = true
+				stalled = append(stalled, s.ep)
+				logx.Warnf("client: connection via %v stalled after %s / %d MB; replacing it", s.ep, now.Sub(s.born).Round(time.Second), s.bytes.Load()/1e6)
+			}
+			if !s.retired && !s.IsClosed() && rs.Attached() {
+				continue
+			}
+			if rs.Finished() {
+				// Everything has been delivered and acknowledged in both
+				// directions, so the server has already let the stream go.
+				// Resuming it would fail and take from the application the
+				// bytes it has not read yet.
+				continue
+			}
+			c.migrating[rs] = true
+			moves = append(moves, rs)
 		}
 		c.mu.Unlock()
 
+		for _, ep := range stalled {
+			c.dialer.ReportStall(ep)
+		}
 		for _, rs := range moves {
-			if err := c.migrate(rs); err != nil {
-				// Leave it where it is; the next tick tries again, and if the
-				// old carrier dies meanwhile the stream just waits to resume.
-				logx.Warnf("client: migrate stream: %v", err)
-			}
+			sem <- struct{}{}
+			go func() {
+				defer func() { <-sem }()
+				err := c.migrate(rs)
+				c.mu.Lock()
+				delete(c.migrating, rs)
+				if err != nil {
+					if ref := c.streams[rs]; ref != nil {
+						ref.nextTry = time.Now().Add(migrateBackoff)
+					}
+				}
+				c.mu.Unlock()
+				if err != nil {
+					// Fail-safe: the stream still holds its old carrier when
+					// it had one, so this costs the user nothing. Otherwise it
+					// buffers and waits, up to resumeTimeout.
+					logx.Warnf("client: move stream: %v", err)
+				}
+			}()
 		}
 
 		// Retired sessions with nothing left on them can go.
@@ -382,46 +513,138 @@ func (c *Client) rotate() {
 }
 
 // migrate continues rs over a stream on a fresh session.
+//
+// It is deliberately prove-then-swap: a new carrier is adopted only once the
+// server has confirmed the stream over it. Until then rs keeps whatever
+// carrier it has, so a failed move costs a user nothing and a rotation can
+// never drop a live connection. Offsets sampled before the swap can only be
+// stale in the safe direction: the peer resends a little and rstream drops
+// what it already has.
 func (c *Client) migrate(rs *rstream.Stream) error {
+	c.mu.Lock()
+	ref := c.streams[rs]
+	c.mu.Unlock()
+	if ref == nil {
+		return nil // closed while we queued
+	}
+	if rs.Finished() {
+		// Nothing left to carry: everything has been delivered and
+		// acknowledged both ways. Leave it alone — the application may still
+		// have received bytes to read, and closing it here would throw them
+		// away. It closes the stream itself when it is done.
+		return nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	sess, carrier, err := c.openRaw(ctx)
 	if err != nil {
 		return err
 	}
-	// Stop the old carrier first so our receive offset is final.
-	rs.Detach()
+
+	// A stream that lost its carrier before either side confirmed a single
+	// byte is cheaper to open again than to resume, and the server has
+	// nothing to resume anyway.
+	if !rs.Attached() && rs.Fresh() {
+		if err := rs.Attach(newHeaderConn(carrier, connectHeader(ref.target, rs.ID())), 0); err != nil {
+			carrier.Close()
+			return ignoreClosed(err)
+		}
+		c.rebind(rs, sess)
+		logx.Debugf("client: reopened stream %x to %v on a fresh connection", rs.ID(), ref.target)
+		return nil
+	}
+
 	dummy := protocol.NewAddress("0.0.0.0", 0)
 	hdr := protocol.Metadata{Command: protocol.CmdResume, Address: dummy}.AppendTo(make([]byte, 0, 64))
 	hdr = binary.BigEndian.AppendUint64(hdr, rs.ID())
 	hdr = binary.BigEndian.AppendUint64(hdr, rs.RecvOffset())
-	_ = carrier.SetDeadline(time.Now().Add(15 * time.Second))
+	_ = carrier.SetDeadline(time.Now().Add(resumeReplyTimeout))
 	if _, err := carrier.Write(hdr); err != nil {
 		carrier.Close()
+		c.dropSession(sess)
 		return err
 	}
 	var reply [9]byte
 	if _, err := io.ReadFull(carrier, reply[:]); err != nil {
+		// No answer over this connection. The usual cause is a pooled
+		// connection the network dropped without telling us, so retire it
+		// instead of opening more streams into a black hole, and hold it
+		// against the route: a route that swallows resumes will swallow the
+		// user traffic we are about to move onto it.
 		carrier.Close()
-		return fmt.Errorf("resume reply: %w", err)
+		c.dropSession(sess)
+		c.dialer.ReportStall(sess.ep)
+		return fmt.Errorf("no resume reply over %v: %w", sess.ep, err)
 	}
 	_ = carrier.SetDeadline(time.Time{})
 	if reply[0] != protocol.ResumeOK {
 		carrier.Close()
-		rs.Close() // the server no longer has it; nothing to continue
-		return fmt.Errorf("server does not know stream %x", rs.ID())
+		if rs.Finished() {
+			// The application closed it while we were asking, so the server
+			// was right to let it go.
+			return nil
+		}
+		// The server has no such stream, and that answer is final: holding on
+		// to the old carrier cannot bring it back, whether or not that
+		// carrier still looks alive to us. (It often does: a connection the
+		// network has dropped without a reset carries a stream's opening
+		// header into nowhere, and nothing local ever notices.)
+		if rs.Fresh() {
+			// Nothing was ever confirmed in either direction, so there is
+			// nothing to continue — open it again on this good connection.
+			// The server replied over that smux stream and closed it, so take
+			// a new one.
+			again, err := sess.OpenStream()
+			if err != nil {
+				return err
+			}
+			if err := rs.Attach(newHeaderConn(again, connectHeader(ref.target, rs.ID())), 0); err != nil {
+				again.Close()
+				return ignoreClosed(err)
+			}
+			c.rebind(rs, sess)
+			logx.Debugf("client: reopened stream %x to %v after the server had lost it", rs.ID(), ref.target)
+			return nil
+		}
+		// It cannot be revived: end it as if the far end had hung up, which
+		// still lets the application read what already arrived.
+		closing := rs.Closing()
+		rs.PeerGone()
+		if closing {
+			// The application had already finished with it, so there is
+			// nothing here worth telling the operator about.
+			return nil
+		}
+		return fmt.Errorf("server no longer has stream %x", rs.ID())
 	}
+	// Adopting the new carrier atomically drops the old one.
 	if err := rs.Attach(carrier, binary.BigEndian.Uint64(reply[1:])); err != nil {
 		carrier.Close()
-		return err
+		return ignoreClosed(err)
 	}
+	c.rebind(rs, sess)
+	logx.Debugf("client: moved stream %x to a fresh connection", rs.ID())
+	return nil
+}
+
+// ignoreClosed drops the error of a stream that ended while it was being
+// moved: the application closed it, which is not a failure to report.
+func ignoreClosed(err error) error {
+	if errors.Is(err, rstream.ErrClosed) {
+		return nil
+	}
+	return err
+}
+
+// rebind records which session now carries rs and clears its backoff.
+func (c *Client) rebind(rs *rstream.Stream, sess *muxSession) {
 	c.mu.Lock()
-	if _, ok := c.streams[rs]; ok {
-		c.streams[rs] = sess
+	if ref := c.streams[rs]; ref != nil {
+		ref.sess = sess
+		ref.nextTry = time.Time{}
 	}
 	c.mu.Unlock()
-	logx.Debugf("client: moved stream %x to a fresh session", rs.ID())
-	return nil
 }
 
 // Close tears down all pooled sessions.

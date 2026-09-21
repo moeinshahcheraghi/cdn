@@ -27,11 +27,16 @@ const ACMEALPN = acme.ALPNProto
 // both ends. It detects dead peers and refreshes NAT state without emitting
 // any application-layer bytes, so idle tunnel sessions stay as silent as an
 // idle browser connection.
+// The timings are deliberately tight. A censor that stops forwarding a flow
+// without resetting it leaves the connection looking alive; at the old
+// 30/15x4 the kernel took about 90 seconds to notice, and every user on that
+// connection was stuck for the whole of it. Probes are bare TCP segments, so
+// nothing above the transport can see them.
 var KeepAlive = net.KeepAliveConfig{
 	Enable:   true,
-	Idle:     30 * time.Second,
-	Interval: 15 * time.Second,
-	Count:    4,
+	Idle:     15 * time.Second,
+	Interval: 5 * time.Second,
+	Count:    3,
 }
 
 // ACME configures automatic certificates from Let's Encrypt (or any ACME CA)

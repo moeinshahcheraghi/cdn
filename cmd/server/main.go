@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -54,6 +55,10 @@ func main() {
 	}
 
 	srv := tunnel.NewServer(tlsCfg, cfg.Passwords, fallback.New(cfg.Fallback))
+	if cfg.WS.Path != "" {
+		srv.SetWebSocketPath(cfg.WS.Path)
+		logx.Infof("websocket carrier on %s (for CDN clients)", cfg.WS.Path)
+	}
 	if cfg.Reality.Dest != "" {
 		rc, err := transport.NewRealityConfig(&transport.RealityServer{
 			Dest: cfg.Reality.Dest, ServerNames: cfg.Reality.ServerNames,
@@ -69,30 +74,66 @@ func main() {
 		logx.Infof("reality mode: imitating %s (sni %v)", cfg.Reality.Dest, cfg.Reality.ServerNames)
 	}
 
-	ln, err := transport.Listen(cfg.Listen)
-	if err != nil {
-		logx.Errorf("listen %s: %v", cfg.Listen, err)
-		os.Exit(1)
+	// The main address may list several ports ("443,8443"): a censor that
+	// blocks one port, or a datacenter that filters it, does not take the
+	// server down, and clients can be pointed at another without a redeploy.
+	var listeners []net.Listener
+	for _, addr := range splitAddrs(cfg.Listen) {
+		ln, err := transport.Listen(addr)
+		if err != nil {
+			logx.Errorf("listen %s: %v", addr, err)
+			os.Exit(1)
+		}
+		listeners = append(listeners, ln)
+		logx.Infof("server listening on %s, fallback -> %s", addr, cfg.Fallback)
+		go acceptLoop(ln, srv.Handle)
 	}
-	logx.Infof("server listening on %s, fallback -> %s", cfg.Listen, cfg.Fallback)
+	// In REALITY mode the main port cannot also serve a CDN, which needs a
+	// real certificate for the domain. ws.listen is that second door.
+	if cfg.WS.Listen != "" {
+		cs := srv.CertHandler()
+		for _, addr := range splitAddrs(cfg.WS.Listen) {
+			ln, err := transport.Listen(addr)
+			if err != nil {
+				logx.Errorf("listen %s: %v", addr, err)
+				os.Exit(1)
+			}
+			listeners = append(listeners, ln)
+			logx.Infof("websocket/CDN listener on %s (certificate TLS)", addr)
+			go acceptLoop(ln, cs.Handle)
+		}
+	}
 	if cfg.ACME.Domain != "" {
 		logx.Infof("acme certificate for %s (cache %s)", cfg.ACME.Domain, cfg.ACME.CacheDir)
 	}
 
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				logx.Errorf("accept: %v", err)
-				return
-			}
-			go srv.Handle(conn)
-		}
-	}()
-
 	waitForSignal()
 	logx.Infof("shutting down")
-	_ = ln.Close()
+	for _, ln := range listeners {
+		_ = ln.Close()
+	}
+}
+
+// acceptLoop hands every accepted connection to handle.
+func acceptLoop(ln net.Listener, handle func(net.Conn)) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go handle(conn)
+	}
+}
+
+// splitAddrs parses a comma-separated address list.
+func splitAddrs(v string) []string {
+	var out []string
+	for _, a := range strings.Split(v, ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func waitForSignal() {

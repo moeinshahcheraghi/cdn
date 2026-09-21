@@ -1,7 +1,6 @@
 package transport
 
 import (
-	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -150,20 +149,24 @@ func RealityHandshake(ctx context.Context, raw net.Conn, cfg *reality.Config) (n
 	return reality.Server(ctx, raw, cfg)
 }
 
+// errRealityRejected means the server treated us as a stranger and showed the
+// real site's certificate.
+var errRealityRejected = errors.New("transport: reality: server did not authenticate us (check public_key, short_id, and that the server's clock is right)")
+
 // realityDial performs the client-side REALITY handshake over raw.
-func (d *Dialer) realityDial(ctx context.Context, raw net.Conn) (net.Conn, error) {
-	serverPub, err := decodeKey(d.Reality.PublicKey)
+func realityDial(ctx context.Context, raw net.Conn, ep *Endpoint, fp string) (net.Conn, error) {
+	serverPub, err := decodeKey(ep.Reality.PublicKey)
 	if err != nil {
 		return nil, err
 	}
-	shortID, err := decodeShortID(d.Reality.ShortID)
+	shortID, err := decodeShortID(ep.Reality.ShortID)
 	if err != nil {
 		return nil, err
 	}
 	var authKey []byte
 	verified := false
 	cfg := &utls.Config{
-		ServerName:             d.SNI,
+		ServerName:             ep.SNI,
 		InsecureSkipVerify:     true, // we verify with the shared key below
 		SessionTicketsDisabled: true,
 		NextProtos:             []string{"h2", "http/1.1"},
@@ -186,10 +189,10 @@ func (d *Dialer) realityDial(ctx context.Context, raw net.Conn) (net.Conn, error
 			// Not ours: it is the real site's chain, meaning the server did
 			// not accept our token (wrong key/short id/clock) or something in
 			// the path is impersonating it. Report clearly either way.
-			return errors.New("transport: reality: server did not authenticate us (check public_key, short_id, server clock)")
+			return errRealityRejected
 		},
 	}
-	uconn := utls.UClient(raw, cfg, clientHelloID(d.Fingerprint))
+	uconn := utls.UClient(raw, cfg, clientHelloID(fp))
 	if err := uconn.BuildHandshakeState(); err != nil {
 		return nil, fmt.Errorf("transport: build hello: %w", err)
 	}
@@ -227,7 +230,7 @@ func (d *Dialer) realityDial(ctx context.Context, raw net.Conn) (net.Conn, error
 	// (session id zeroed) as associated data, so it cannot be transplanted.
 	sid := make([]byte, 32)
 	copy(sid, clientVersion[:])
-	binary.BigEndian.PutUint32(sid[4:], uint32(time.Now().Unix()))
+	binary.BigEndian.PutUint32(sid[4:], uint32(now().Unix()))
 	copy(sid[8:], shortID[:])
 	copy(hello.Raw[39:], make([]byte, 32))
 	sealed := aead.Seal(nil, hello.Random[20:], sid[:16], hello.Raw)
@@ -235,6 +238,9 @@ func (d *Dialer) realityDial(ctx context.Context, raw net.Conn) (net.Conn, error
 	hello.SessionId = sealed
 
 	if err := uconn.HandshakeContext(ctx); err != nil {
+		if errors.Is(err, errRealityRejected) {
+			return nil, errRealityRejected
+		}
 		return nil, fmt.Errorf("transport: reality handshake: %w", err)
 	}
 	if !verified {
@@ -243,5 +249,3 @@ func (d *Dialer) realityDial(ctx context.Context, raw net.Conn) (net.Conn, error
 	}
 	return uconn, nil
 }
-
-var _ = bytes.Equal
