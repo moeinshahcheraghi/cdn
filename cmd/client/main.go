@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"net"
@@ -170,6 +171,33 @@ func runDiag(cfg *config.ClientConfig) int {
 		return 1
 	}
 	opened := time.Since(t0)
+	// An open stream proves only the handshake. A censor that lets the
+	// handshake through and then drops everything leaves the stream looking
+	// open, so push real bytes and wait for the server to acknowledge them.
+	if acker, ok := st.(interface{ Acked() uint64 }); ok {
+		probe := make([]byte, 16<<10)
+		_, _ = rand.Read(probe)
+		t1 := time.Now()
+		if _, err := st.Write(probe); err != nil {
+			fmt.Printf("tunnel check: write FAILED: %v\n", err)
+			return 1
+		}
+		for acker.Acked() < uint64(len(probe)) {
+			if time.Since(t1) > 10*time.Second {
+				fmt.Printf("tunnel check: handshake OK but 16 KB of data got NO acknowledgement in 10s.\n")
+				fmt.Printf("  The route lets the TLS handshake through and then drops the traffic — typical of a\n")
+				fmt.Printf("  datacenter that filters foreign IPs, or DPI cutting the flow. Protocol changes on\n")
+				fmt.Printf("  this route will not help: use another route (CDN backup, another exit, or a hop).\n")
+				fmt.Printf("  (If the server log at \"debug\" shows \"fallback: serving probe\", the password differs instead.)\n")
+				st.Close()
+				return 1
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		fmt.Printf("tunnel check: data path OK, 16 KB acknowledged in %v\n", time.Since(t1).Round(time.Millisecond))
+		st.Close()
+		return failed
+	}
 	_ = st.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 1)
 	_, rerr := st.Read(buf)

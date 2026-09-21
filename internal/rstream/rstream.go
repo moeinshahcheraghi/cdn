@@ -145,6 +145,13 @@ func (s *Stream) SetOnCarrierLost(f func()) {
 	s.mu.Unlock()
 }
 
+// Acked reports how many of our bytes the peer has acknowledged receiving.
+func (s *Stream) Acked() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sendBase
+}
+
 // Fresh reports whether the peer has never confirmed anything on this
 // stream: it acknowledged no byte we sent and we received none. Such a
 // stream can be restarted from scratch rather than resumed — whatever we
