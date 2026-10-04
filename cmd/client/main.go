@@ -141,6 +141,10 @@ func runDiag(cfg *config.ClientConfig) int {
 				} else {
 					fmt.Printf("  clock agrees with %s (%v)\n", ep.SNI, skew.Round(time.Second))
 				}
+			} else {
+				// This is a plain HTTPS request that the server splices to the
+				// real site. Failing after a good handshake means data is cut.
+				fmt.Printf("  plain HTTPS to %s through this route FAILED: %v\n", ep.SNI, err)
 			}
 		}
 	}
