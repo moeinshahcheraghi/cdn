@@ -362,12 +362,14 @@ Server — a second door, since a REALITY port cannot also serve a CDN:
 Client — usually as a backup, so the direct route is preferred while it works:
 
 ```json
-"backups": [{ "server": "cdn.example.com:443", "sni": "cdn.example.com",
+"backups": [{ "server": "cdn.example.com:8443", "sni": "cdn.example.com",
               "ws": { "path": "/live/stream/5f3c1a9e" } }]
 ```
 
 In Cloudflare: an A record for that name at the exit IP, proxied (orange
-cloud), SSL mode Full, WebSockets on. `path` is a second secret; every other
+cloud), SSL mode Full, WebSockets on. The client's port must be the same as
+`ws.listen` (8443 here): Cloudflare connects to the origin on the port the
+client used, and 443 would land on the REALITY port. `path` is a second secret; every other
 path on the port is served by the fallback site, so scanning finds nothing.
 
 ## Routes and failover

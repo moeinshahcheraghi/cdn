@@ -27,7 +27,7 @@
   // dropped again the moment it recovers. A CDN backup survives the exit IP
   // being blocked outright.
   // "backups": [
-  //   { "server": "cdn.example.com:443", "sni": "cdn.example.com",
+  //   { "server": "cdn.example.com:8443", "sni": "cdn.example.com",
   //     "ws": { "path": "/live/stream/5f3c1a9e" } }
   // ],
   //

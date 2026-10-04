@@ -35,7 +35,7 @@
     {
       // دامنه‌ی خودتان که در کلودفلر پروکسی (ابر نارنجی) است و به IP این exit
       // اشاره می‌کند. اتصال در واقع به IP های کلودفلر می‌رود.
-      "server": "cdn.example.com:443",
+      "server": "cdn.example.com:8443",
       "sni": "cdn.example.com",
       // همان path که در ws.path سرور گذاشتید.
       "ws": { "path": "/live/stream/5f3c1a9e" }
