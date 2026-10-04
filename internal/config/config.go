@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -91,6 +92,72 @@ type Backup struct {
 	Reality       RealityClientConfig `json:"reality"`
 	WS            WSClientConfig      `json:"ws"`
 	AllowInsecure bool                `json:"allow_insecure"`
+	// Fragment overrides the top-level fragment setting for this route.
+	Fragment *FragmentConfig `json:"fragment"`
+}
+
+// FragmentConfig splits the TLS ClientHello so a censor cannot read the SNI
+// from one packet. The server and the CDN reassemble it as usual.
+type FragmentConfig struct {
+	Enabled bool `json:"enabled"`
+	// Mode "records" (default) cuts the hello into several TLS records, each
+	// in its own TCP segment; "tcp" keeps one record and only splits the
+	// segments, for a middlebox that rejects split records.
+	Mode string `json:"mode"`
+	// Size is the byte range of each piece, e.g. "30-80"; one cut always
+	// falls inside the server name.
+	Size string `json:"size"`
+	// Delay is the pause between pieces in milliseconds, e.g. "5-15".
+	Delay string `json:"delay"`
+}
+
+// Range parses "a-b" (or a single number) into a non-negative interval.
+func Range(s string) (lo, hi int, err error) {
+	a, b, ok := strings.Cut(strings.TrimSpace(s), "-")
+	if !ok {
+		b = a
+	}
+	if lo, err = strconv.Atoi(strings.TrimSpace(a)); err != nil {
+		return 0, 0, fmt.Errorf("bad range %q", s)
+	}
+	if hi, err = strconv.Atoi(strings.TrimSpace(b)); err != nil {
+		return 0, 0, fmt.Errorf("bad range %q", s)
+	}
+	if lo < 0 || hi < lo {
+		return 0, 0, fmt.Errorf("bad range %q", s)
+	}
+	return lo, hi, nil
+}
+
+// check fills in defaults and validates f.
+func (f *FragmentConfig) check() error {
+	if f == nil || !f.Enabled {
+		return nil
+	}
+	switch f.Mode {
+	case "":
+		f.Mode = "records"
+	case "records", "tcp":
+	default:
+		return fmt.Errorf("fragment.mode must be records or tcp, not %q", f.Mode)
+	}
+	if f.Size == "" {
+		f.Size = "30-80"
+	}
+	if f.Delay == "" {
+		f.Delay = "5-15"
+	}
+	lo, _, err := Range(f.Size)
+	if err != nil {
+		return fmt.Errorf("fragment.size: %w", err)
+	}
+	if lo < 1 {
+		return fmt.Errorf("fragment.size must be at least 1")
+	}
+	if _, _, err := Range(f.Delay); err != nil {
+		return fmt.Errorf("fragment.delay: %w", err)
+	}
+	return nil
 }
 
 // RealityClientConfig is the client half of REALITY.
@@ -129,6 +196,9 @@ type ClientConfig struct {
 	Backups []Backup `json:"backups"`
 	// Fingerprint mimics a browser's TLS ClientHello: chrome|firefox|safari|ios|edge|random.
 	Fingerprint string `json:"fingerprint"`
+	// Fragment splits the ClientHello against SNI filtering; backups
+	// inherit it unless they set their own.
+	Fragment *FragmentConfig `json:"fragment"`
 	// SocksListen / HTTPListen are local proxy addresses (either may be empty).
 	SocksListen string `json:"socks_listen"`
 	HTTPListen  string `json:"http_listen"`
@@ -266,9 +336,18 @@ func LoadClient(path string) (*ClientConfig, error) {
 		// a single packet and handshakes reliably.
 		c.Fingerprint = "firefox"
 	}
+	if err := c.Fragment.check(); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
 	for i := range c.Backups {
-		if c.Backups[i].Fingerprint == "" {
-			c.Backups[i].Fingerprint = c.Fingerprint
+		b := &c.Backups[i]
+		if b.Fingerprint == "" {
+			b.Fingerprint = c.Fingerprint
+		}
+		if b.Fragment == nil {
+			b.Fragment = c.Fragment
+		} else if err := b.Fragment.check(); err != nil {
+			return nil, fmt.Errorf("config: backups[%d]: %w", i, err)
 		}
 	}
 	if c.SocksListen == "" && c.HTTPListen == "" && len(c.Forwards) == 0 {

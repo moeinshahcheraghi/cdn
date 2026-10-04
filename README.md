@@ -16,6 +16,7 @@ active probing را خنثی می‌کند. محدودیت پهنای‌باند
 | Censor technique | Countermeasure |
 | --- | --- |
 | TLS fingerprinting (JA3/JA4) | uTLS copies a real Chrome/Firefox/Safari ClientHello |
+| SNI filtering | optional `fragment`: the ClientHello is cut into small TLS records / TCP segments, one cut inside the server name |
 | SNI blocking | You set the SNI to your own (or an allowed) domain |
 | Active probing | Wrong-auth connections are reverse-proxied to a real site |
 | Protocol/entropy analysis | It *is* real TLS 1.3, not an obfuscated stream |

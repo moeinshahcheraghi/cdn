@@ -14,6 +14,12 @@
   // Iran) drop the split ClientHello, causing handshake timeouts. firefox/safari
   // fit in one packet.
   "fingerprint": "firefox",
+  // Split the ClientHello into small pieces so DPI cannot read the SNI from
+  // one packet. For a network that filters by domain: e.g. from some Iranian
+  // datacenters several .ir domains behind Cloudflare were reset or had their
+  // upload cut after 64 KB. mode "records" (default) also splits TLS records; "tcp" only the
+  // segments. Costs ~100-200 ms per new connection. Backups inherit it.
+  // "fragment": { "enabled": true, "mode": "records", "size": "30-80", "delay": "5-15" },
   // REALITY, when public_key is set: the server borrows a big site's identity
   // and "server" may be a bare IP. "sni" must then be one of its server_names.
   // "reality": { "public_key": "FROM_SERVER_KEYGEN", "short_id": "a1b2c3d4" },

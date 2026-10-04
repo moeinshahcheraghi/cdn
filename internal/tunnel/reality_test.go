@@ -64,6 +64,13 @@ func TestRealityEndToEnd(t *testing.T) {
 	}
 	stream.Close()
 
+	// 1b) A fragmented ClientHello still authenticates, in both modes.
+	for _, mode := range []string{"records", "tcp"} {
+		fc := *cfg
+		fc.Fragment = &config.FragmentConfig{Enabled: true, Mode: mode, Size: "10-40", Delay: "1-3"}
+		t.Run("fragment-"+mode, func(t *testing.T) { echoThrough(t, &fc, echo.Addr().String(), 256<<10) })
+	}
+
 	// 2) A prober with the right SNI but no key gets Microsoft's real chain.
 	pc, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{ServerName: "www.microsoft.com", MinVersion: tls.VersionTLS13})
 	if err != nil {

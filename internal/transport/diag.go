@@ -30,7 +30,7 @@ func HelloSize(fp, sni string) int {
 // stage and an error for the first stage that failed.
 func (d *Dialer) Probe(ctx context.Context, ep *Endpoint, fp string) (tcp, hs time.Duration, err error) {
 	t0 := time.Now()
-	raw, err := d.tcp.DialContext(ctx, "tcp", ep.Server)
+	raw, err := d.dialRaw(ctx, ep)
 	if err != nil {
 		return time.Since(t0), 0, err
 	}

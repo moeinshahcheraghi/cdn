@@ -107,6 +107,9 @@ func runDiag(cfg *config.ClientConfig) int {
 	failed, worked := 0, 0
 	for _, ep := range d.Endpoints() {
 		fmt.Printf("endpoint %s tier=%d\n", ep, ep.Tier)
+		if f := ep.Fragment; f != nil {
+			fmt.Printf("  fragment: %s, pieces of %d-%d bytes, %v-%v apart\n", f, f.MinSize, f.MaxSize, f.MinDelay, f.MaxDelay)
+		}
 		fps := append([]string{ep.Fingerprint}, transport.Fingerprints...)
 		seen := map[string]bool{}
 		for _, fp := range fps {

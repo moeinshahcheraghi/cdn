@@ -130,3 +130,46 @@ func TestWrongWebSocketPathLooksLikeAWebsite(t *testing.T) {
 		}
 	}
 }
+
+// A fragmented ClientHello must still handshake with the CDN in both modes.
+func TestFragmentedHelloThroughCDN(t *testing.T) {
+	env := startEnv(t, func(s *Server) { s.SetWebSocketPath(wsPath) })
+	cdn := fakeCDN(t, env.server)
+	for _, mode := range []string{"records", "tcp"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := &config.ClientConfig{
+				Server: cdn, Password: testPassword, SNI: "cdn.example",
+				Fingerprint: "firefox", AllowInsecure: true,
+				WS:       config.WSClientConfig{Path: wsPath},
+				Fragment: &config.FragmentConfig{Enabled: true, Mode: mode, Size: "10-40", Delay: "1-3"},
+				Mux:      config.MuxConfig{Enabled: true, Concurrency: 4, Pool: 1},
+			}
+			echoThrough(t, cfg, env.echo, 256<<10)
+		})
+	}
+}
+
+// echoThrough sends n random bytes to the echo service over a fresh client
+// built from cfg and checks they come back intact.
+func echoThrough(t *testing.T, cfg *config.ClientConfig, echo string, n int) {
+	t.Helper()
+	c := NewClient(cfg)
+	t.Cleanup(c.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	stream, err := c.OpenStream(ctx, addrOf(t, echo))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer stream.Close()
+	payload := make([]byte, n)
+	rand.Read(payload)
+	go func() {
+		stream.Write(payload)
+		stream.(interface{ CloseWrite() error }).CloseWrite()
+	}()
+	got, err := io.ReadAll(io.LimitReader(stream, int64(n)))
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("echo: %d of %d bytes, err %v", len(got), n, err)
+	}
+}

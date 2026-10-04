@@ -27,6 +27,8 @@ type Endpoint struct {
 	Reality *RealityClient
 	// WS, when set, wraps the stream in a WebSocket so it can pass a CDN.
 	WS *WSClient
+	// Fragment, when set, splits the ClientHello (see fragment.go).
+	Fragment *Fragment
 	// Tier orders endpoints: a higher tier is used only while every endpoint
 	// of the lower tiers is failing (0 = primary, 1 = backup).
 	Tier int
@@ -50,6 +52,9 @@ func (e *Endpoint) String() string {
 		mode = "reality"
 	case e.WS != nil:
 		mode = "ws"
+	}
+	if e.Fragment != nil {
+		mode += ", fragment"
 	}
 	return fmt.Sprintf("%s (%s, sni %s)", e.Server, mode, e.SNI)
 }
@@ -193,7 +198,7 @@ func (d *Dialer) report(ep *Endpoint, err error) {
 // DialEndpoint connects over one specific endpoint. fp overrides the
 // endpoint's fingerprint when not empty (diagnostics).
 func (d *Dialer) DialEndpoint(ctx context.Context, ep *Endpoint, fp string) (net.Conn, error) {
-	raw, err := d.tcp.DialContext(ctx, "tcp", ep.Server)
+	raw, err := d.dialRaw(ctx, ep)
 	if err != nil {
 		return nil, fmt.Errorf("transport: dial %s: %w", ep.Server, err)
 	}
@@ -205,12 +210,24 @@ func (d *Dialer) DialEndpoint(ctx context.Context, ep *Endpoint, fp string) (net
 	return &epConn{Conn: conn, ep: ep}, nil
 }
 
+// dialRaw opens the TCP connection to ep, with no Nagle delay (low latency,
+// and it keeps fragmented hello pieces in separate segments).
+func (d *Dialer) dialRaw(ctx context.Context, ep *Endpoint) (net.Conn, error) {
+	raw, err := d.tcp.DialContext(ctx, "tcp", ep.Server)
+	if err != nil {
+		return nil, err
+	}
+	if t, ok := raw.(*net.TCPConn); ok {
+		_ = t.SetNoDelay(true)
+	}
+	return fragment(raw, ep.Fragment, ep.SNI), nil
+}
+
 // handshake dresses raw according to ep.
 func (d *Dialer) handshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp string) (net.Conn, error) {
 	if fp == "" {
 		fp = ep.Fingerprint
 	}
-	_ = raw.(*net.TCPConn).SetNoDelay(true) // low latency: don't wait to coalesce small writes
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = raw.SetDeadline(deadline)
 	} else {
@@ -223,11 +240,10 @@ func (d *Dialer) handshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp s
 		if errors.Is(err, errRealityRejected) && syncClock(ctx, &d.tcp, ep) {
 			// Our clock was wrong and is now compensated; the token is bound
 			// to the time, so try once more on a fresh connection.
-			raw2, derr := d.tcp.DialContext(ctx, "tcp", ep.Server)
+			raw2, derr := d.dialRaw(ctx, ep)
 			if derr != nil {
 				return nil, err
 			}
-			_ = raw2.(*net.TCPConn).SetNoDelay(true)
 			if deadline, ok := ctx.Deadline(); ok {
 				_ = raw2.SetDeadline(deadline)
 			}
