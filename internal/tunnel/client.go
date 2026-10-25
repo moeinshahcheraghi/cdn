@@ -143,7 +143,7 @@ func NewClient(c *config.ClientConfig) *Client {
 // as tier 0 and each backup as tier 1.
 func Endpoints(c *config.ClientConfig) []transport.Endpoint {
 	var eps []transport.Endpoint
-	add := func(tier int, server string, servers []string, sni, fp string, r config.RealityClientConfig, ws config.WSClientConfig, insecure bool, frag *config.FragmentConfig) {
+	add := func(tier int, server string, servers []string, sni, fp string, r config.RealityClientConfig, ws, h config.WSClientConfig, insecure bool, frag *config.FragmentConfig) {
 		if len(servers) == 0 {
 			servers = []string{server}
 		}
@@ -155,13 +155,16 @@ func Endpoints(c *config.ClientConfig) []transport.Endpoint {
 			if ws.Path != "" {
 				ep.WS = &transport.WSClient{Path: ws.Path, Host: ws.Host}
 			}
+			if h.Path != "" {
+				ep.HTTP = &transport.WSClient{Path: h.Path, Host: h.Host}
+			}
 			ep.Fragment = fragmentOf(frag)
 			eps = append(eps, ep)
 		}
 	}
-	add(0, c.Server, c.Servers, c.SNI, c.Fingerprint, c.Reality, c.WS, c.AllowInsecure, c.Fragment)
+	add(0, c.Server, c.Servers, c.SNI, c.Fingerprint, c.Reality, c.WS, c.HTTP, c.AllowInsecure, c.Fragment)
 	for _, b := range c.Backups {
-		add(1, b.Server, b.Servers, b.SNI, b.Fingerprint, b.Reality, b.WS, b.AllowInsecure, b.Fragment)
+		add(1, b.Server, b.Servers, b.SNI, b.Fingerprint, b.Reality, b.WS, b.HTTP, b.AllowInsecure, b.Fragment)
 	}
 	return eps
 }

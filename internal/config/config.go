@@ -91,6 +91,7 @@ type Backup struct {
 	Fingerprint   string              `json:"fingerprint"`
 	Reality       RealityClientConfig `json:"reality"`
 	WS            WSClientConfig      `json:"ws"`
+	HTTP          WSClientConfig      `json:"http"`
 	AllowInsecure bool                `json:"allow_insecure"`
 	// Fragment overrides the top-level fragment setting for this route.
 	Fragment *FragmentConfig `json:"fragment"`
@@ -192,6 +193,11 @@ type ClientConfig struct {
 	// WS, when path is set, carries the tunnel in a WebSocket (through a CDN:
 	// server is then the CDN-proxied domain or a CDN IP, sni the domain).
 	WS WSClientConfig `json:"ws"`
+	// HTTP, when path is set, carries the tunnel in plain HTTP/2 requests
+	// through a CDN instead of a WebSocket: the browser's TLS hello goes out
+	// unchanged and the traffic is ordinary downloads and uploads. The path
+	// is the server's ws.path, which accepts both.
+	HTTP WSClientConfig `json:"http"`
 	// Backups are alternative routes tried while the primary one fails.
 	Backups []Backup `json:"backups"`
 	// Fingerprint mimics a browser's TLS ClientHello: chrome|firefox|safari|ios|edge|random.
@@ -304,8 +310,11 @@ func LoadClient(path string) (*ClientConfig, error) {
 		c.Forwards[i].Listen = cleanHost(c.Forwards[i].Listen)
 		c.Forwards[i].Target = cleanHost(c.Forwards[i].Target)
 	}
-	if c.Reality.PublicKey != "" && c.WS.Path != "" {
-		return nil, fmt.Errorf("config: reality and ws cannot be combined on one route; put the ws route in backups")
+	if c.Reality.PublicKey != "" && (c.WS.Path != "" || c.HTTP.Path != "") {
+		return nil, fmt.Errorf("config: reality and ws/http cannot be combined on one route; put the CDN route in backups")
+	}
+	if c.WS.Path != "" && c.HTTP.Path != "" {
+		return nil, fmt.Errorf("config: a route is either ws or http, not both")
 	}
 	for i := range c.Backups {
 		b := &c.Backups[i]
@@ -316,8 +325,11 @@ func LoadClient(path string) (*ClientConfig, error) {
 		if b.Server == "" && len(b.Servers) == 0 {
 			return nil, fmt.Errorf("config: backups[%d]: server is required", i)
 		}
-		if b.Reality.PublicKey != "" && b.WS.Path != "" {
-			return nil, fmt.Errorf("config: backups[%d]: reality and ws cannot be combined", i)
+		if b.Reality.PublicKey != "" && (b.WS.Path != "" || b.HTTP.Path != "") {
+			return nil, fmt.Errorf("config: backups[%d]: reality and ws/http cannot be combined", i)
+		}
+		if b.WS.Path != "" && b.HTTP.Path != "" {
+			return nil, fmt.Errorf("config: backups[%d]: a route is either ws or http, not both", i)
 		}
 	}
 	if c.Server == "" && len(c.Servers) > 0 {

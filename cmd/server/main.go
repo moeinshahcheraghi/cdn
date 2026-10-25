@@ -57,7 +57,7 @@ func main() {
 	srv := tunnel.NewServer(tlsCfg, cfg.Passwords, fallback.New(cfg.Fallback))
 	if cfg.WS.Path != "" {
 		srv.SetWebSocketPath(cfg.WS.Path)
-		logx.Infof("websocket carrier on %s (for CDN clients)", cfg.WS.Path)
+		logx.Infof("websocket and http carriers on %s (for CDN clients)", cfg.WS.Path)
 	}
 	if cfg.Reality.Dest != "" {
 		rc, err := transport.NewRealityConfig(&transport.RealityServer{

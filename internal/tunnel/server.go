@@ -7,13 +7,17 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/moeinshah0/tunnel/internal/fallback"
+	"github.com/moeinshah0/tunnel/internal/httpconn"
 	"github.com/moeinshah0/tunnel/internal/logx"
 	"github.com/moeinshah0/tunnel/internal/pad"
 	"github.com/moeinshah0/tunnel/internal/protocol"
@@ -46,7 +50,8 @@ type Server struct {
 	reality   *reality.Config // when set, REALITY replaces tlsConfig
 	hashes    [][]byte        // accepted password digests
 	fallback  *fallback.Handler
-	wsPath    string // when set, a WebSocket upgrade to this path is a carrier
+	wsPath    string        // when set, a WebSocket upgrade to this path is a carrier
+	hub       *httpconn.Hub // HTTP carriers below wsPath; set with wsPath
 
 	// streams holds live resumable streams by id, across carriers — and
 	// across listeners, so a stream opened on the main port can be resumed
@@ -63,10 +68,14 @@ type streamTable struct {
 // SetReality switches the server to REALITY mode.
 func (s *Server) SetReality(cfg *reality.Config) { s.reality = cfg }
 
-// SetWebSocketPath accepts the tunnel inside a WebSocket upgrade to path, so
-// clients can reach the server through a CDN. Every other request, and every
-// other path, is still served by the fallback site.
-func (s *Server) SetWebSocketPath(path string) { s.wsPath = path }
+// SetWebSocketPath accepts the tunnel inside a WebSocket upgrade to path,
+// and as HTTP requests below path (see package httpconn), so clients can
+// reach the server through a CDN. Every other request, and every other path,
+// is still served by the fallback site.
+func (s *Server) SetWebSocketPath(path string) {
+	s.wsPath = path
+	s.hub = httpconn.NewHub(s.serveDecrypted)
+}
 
 // CertHandler returns a view of this server that terminates ordinary
 // certificate TLS instead of REALITY, for a second port a CDN connects to.
@@ -78,6 +87,7 @@ func (s *Server) CertHandler() *Server {
 		hashes:    s.hashes,
 		fallback:  s.fallback,
 		wsPath:    s.wsPath,
+		hub:       s.hub,
 		streams:   s.streams,
 	}
 }
@@ -143,13 +153,19 @@ func (s *Server) serveDecrypted(conn net.Conn) {
 	// is judged immediately and replayed verbatim to the fallback origin.
 	prefix := make([]byte, protocol.HashLen)
 	n, err := conn.Read(prefix)
+	if n == 0 && (errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)) {
+		// Gone without a word: a CDN's spare connection, or a carrier
+		// dropped before use. A web server just closes too.
+		conn.Close()
+		return
+	}
 	if err != nil {
 		_ = conn.SetDeadline(time.Time{})
 		s.fallback.Serve(conn, prefix[:n])
 		return
 	}
 	if s.wsPath != "" && looksHTTP(prefix[:n]) {
-		s.serveWebSocket(conn, prefix[:n])
+		s.serveHTTP(conn, prefix[:n])
 		return
 	}
 	if !s.authorized(prefix[:n]) {
@@ -198,34 +214,122 @@ func looksHTTP(b []byte) bool {
 		bytes.HasPrefix(b, []byte("POST ")) || bytes.HasPrefix(b, []byte("OPTI"))
 }
 
-// serveWebSocket handles an HTTP request that arrived instead of a digest.
-// A WebSocket upgrade to the secret path becomes a tunnel carrier; anything
-// else is a visitor (or a probe) and goes to the fallback site untouched,
-// bytes and all, so the port is a plain website to everyone but us.
-func (s *Server) serveWebSocket(conn net.Conn, prefix []byte) {
-	// seen records the bytes read, so a visitor can be handed to the
-	// fallback untouched. Recording stops once the request is judged: an
-	// accepted carrier must not copy its whole life into memory.
+// serveHTTP handles a connection that began with an HTTP request instead of
+// a digest: a CDN (or a visitor, or a probe). Bytes that do not even parse
+// as HTTP go to the fallback site untouched. Otherwise the connection is
+// served request by request, because a CDN sends every request for the
+// domain down the same few connections: tunnel requests become carriers and
+// everything else is answered by the fallback site, so the port is a plain
+// website to everyone but us.
+func (s *Server) serveHTTP(conn net.Conn, prefix []byte) {
+	// rec keeps the bytes read while judging the first request, so they
+	// can be replayed to whoever ends up serving the connection.
 	rec := &recorder{}
 	rec.buf.Write(prefix)
-	br := bufio.NewReaderSize(io.TeeReader(conn, rec), 32*1024)
-	// The request line already read is replayed ahead of the rest.
-	full := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(prefix), br), 32*1024)
-	req, err := http.ReadRequest(full)
-	if err != nil || req.URL.Path != s.wsPath || !wsconn.IsUpgrade(req) {
-		_ = conn.SetDeadline(time.Time{})
-		s.fallback.Serve(conn, rec.stop())
-		return
-	}
-	rec.stop()
-	ws, err := wsconn.Accept(conn, full, req)
+	full := bufio.NewReader(io.MultiReader(bytes.NewReader(prefix), io.TeeReader(conn, rec)))
+	_, err := http.ReadRequest(full)
+	seen := rec.stop()
+	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
-		conn.Close()
+		s.fallback.Serve(conn, seen)
 		return
 	}
-	logx.Debugf("server: websocket carrier from %s", conn.RemoteAddr())
-	s.serveDecrypted(ws)
+	rc := &replayConn{Conn: conn, r: io.MultiReader(bytes.NewReader(seen), conn)}
+	ln := &oneConnListener{conn: rc, done: make(chan struct{})}
+	hs := &http.Server{
+		Handler:           http.HandlerFunc(s.route),
+		ReadHeaderTimeout: authTimeout,
+		IdleTimeout:       10 * time.Minute,
+		ErrorLog:          log.New(io.Discard, "", 0),
+		// A hijacked connection (a WebSocket) is finished when its handler
+		// returns, which then closes ln itself.
+		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
+			return context.WithValue(ctx, connListenerKey{}, ln)
+		},
+		ConnState: func(_ net.Conn, st http.ConnState) {
+			if st == http.StateClosed {
+				ln.Close()
+			}
+		},
+	}
+	// Serve returns once ln is closed, i.e. when the connection is done.
+	_ = hs.Serve(ln)
 }
+
+type connListenerKey struct{}
+
+// route serves one request that reached an HTTP connection.
+func (s *Server) route(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == s.wsPath && wsconn.IsUpgrade(r) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		if ln, ok := r.Context().Value(connListenerKey{}).(*oneConnListener); ok {
+			defer ln.Close()
+		}
+		ws, err := wsconn.Accept(conn, brw.Reader, r)
+		if err != nil {
+			conn.Close()
+			return
+		}
+		logx.Debugf("server: websocket carrier from %s", conn.RemoteAddr())
+		s.serveDecrypted(ws)
+		return
+	}
+	if rest, ok := strings.CutPrefix(r.URL.Path, s.wsPath+"/"); ok && s.hub.Handle(w, r, rest) {
+		return
+	}
+	s.fallback.HTTP().ServeHTTP(w, r)
+}
+
+// replayConn reads r (bytes already consumed from Conn, then Conn itself).
+type replayConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (c *replayConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+func (c *replayConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+// oneConnListener hands out a single connection, then reports closed once
+// that connection is finished with.
+type oneConnListener struct {
+	mu   sync.Mutex
+	conn net.Conn
+	done chan struct{}
+	once sync.Once
+}
+
+func (l *oneConnListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	c := l.conn
+	l.conn = nil
+	l.mu.Unlock()
+	if c != nil {
+		return c, nil
+	}
+	<-l.done
+	return nil, net.ErrClosed
+}
+
+func (l *oneConnListener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return nil
+}
+
+func (l *oneConnListener) Addr() net.Addr { return dummyAddr{} }
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "tcp" }
+func (dummyAddr) String() string  { return "http" }
 
 // recorder is a Writer that keeps what it is given until stopped.
 type recorder struct {

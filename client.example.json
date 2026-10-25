@@ -24,17 +24,18 @@
   // and "server" may be a bare IP. "sni" must then be one of its server_names.
   // "reality": { "public_key": "FROM_SERVER_KEYGEN", "short_id": "a1b2c3d4" },
   //
-  // Carry the tunnel inside a WebSocket, which is how it passes through a CDN
-  // (Cloudflare): "server"/"sni" are then your CDN-proxied domain and "path"
-  // must match the server's ws.path.
-  // "ws": { "path": "/live/stream/5f3c1a9e" },
+  // Carry the tunnel in plain HTTP/2 requests, which is how it passes through
+  // a CDN (Cloudflare): "server"/"sni" are then your CDN-proxied domain and
+  // "path" must match the server's ws.path. "ws" in place of "http" uses a
+  // WebSocket instead (the older carrier).
+  // "http": { "path": "/live/stream/5f3c1a9e" },
   //
   // Alternative routes, used only while the route above is failing, and
   // dropped again the moment it recovers. A CDN backup survives the exit IP
   // being blocked outright.
   // "backups": [
   //   { "server": "cdn.example.com:8443", "sni": "cdn.example.com",
-  //     "ws": { "path": "/live/stream/5f3c1a9e" } }
+  //     "http": { "path": "/live/stream/5f3c1a9e" } }
   // ],
   //
   // Local proxies. Point your browser/system at either.

@@ -11,6 +11,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 
+	"github.com/moeinshah0/tunnel/internal/httpconn"
 	"github.com/moeinshah0/tunnel/internal/logx"
 	"github.com/moeinshah0/tunnel/internal/wsconn"
 )
@@ -27,6 +28,9 @@ type Endpoint struct {
 	Reality *RealityClient
 	// WS, when set, wraps the stream in a WebSocket so it can pass a CDN.
 	WS *WSClient
+	// HTTP, when set, carries the stream in plain HTTP/2 requests through a
+	// CDN instead (see package httpconn); its fields mean the same as WS's.
+	HTTP *WSClient
 	// Fragment, when set, splits the ClientHello (see fragment.go).
 	Fragment *Fragment
 	// Tier orders endpoints: a higher tier is used only while every endpoint
@@ -39,7 +43,7 @@ type Endpoint struct {
 	probing   bool
 }
 
-// WSClient configures the WebSocket wrapping of an endpoint.
+// WSClient configures the WebSocket (or HTTP) wrapping of an endpoint.
 type WSClient struct {
 	Path string // must equal the server's ws.path
 	Host string // Host header; defaults to the SNI
@@ -52,6 +56,8 @@ func (e *Endpoint) String() string {
 		mode = "reality"
 	case e.WS != nil:
 		mode = "ws"
+	case e.HTTP != nil:
+		mode = "http"
 	}
 	if e.Fragment != nil {
 		mode += ", fragment"
@@ -277,6 +283,22 @@ func (d *Dialer) handshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp s
 	}
 	if err := uconn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("transport: tls handshake: %w", err)
+	}
+	if ep.HTTP != nil {
+		// The browser's own hello, h2 and all, goes out unchanged; the CDN
+		// must then pick h2, as every major one does.
+		if p := uconn.ConnectionState().NegotiatedProtocol; p != "h2" {
+			return nil, fmt.Errorf("transport: http route needs HTTP/2 from the CDN, got %q", p)
+		}
+		host := ep.HTTP.Host
+		if host == "" {
+			host = ep.SNI
+		}
+		hc, err := httpconn.Dial(ctx, uconn, host, ep.HTTP.Path)
+		if err != nil {
+			return nil, fmt.Errorf("transport: %w", err)
+		}
+		return hc, nil
 	}
 	if ep.WS == nil {
 		return uconn, nil
