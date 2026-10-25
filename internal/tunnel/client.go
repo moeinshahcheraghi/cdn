@@ -143,9 +143,15 @@ func NewClient(c *config.ClientConfig) *Client {
 // as tier 0 and each backup as tier 1.
 func Endpoints(c *config.ClientConfig) []transport.Endpoint {
 	var eps []transport.Endpoint
-	add := func(tier int, server string, servers []string, sni, fp string, r config.RealityClientConfig, ws, h config.WSClientConfig, insecure bool, frag *config.FragmentConfig) {
+	add := func(tier int, server string, servers []string, sni, fp string, r config.RealityClientConfig, ws, h config.WSClientConfig, ech string, insecure bool, frag *config.FragmentConfig) {
 		if len(servers) == 0 {
 			servers = []string{server}
+		}
+		// One key holder per route: keys a CDN sends back on one of its IPs
+		// are good for all of them.
+		var keys *transport.ECH
+		if list, err := transport.ParseECHList(ech); ech != "" && err == nil {
+			keys = transport.NewECH(list)
 		}
 		for _, srv := range servers {
 			ep := transport.Endpoint{Server: srv, SNI: sni, Fingerprint: fp, AllowInsecure: insecure, Tier: tier}
@@ -158,13 +164,14 @@ func Endpoints(c *config.ClientConfig) []transport.Endpoint {
 			if h.Path != "" {
 				ep.HTTP = &transport.WSClient{Path: h.Path, Host: h.Host}
 			}
+			ep.ECH = keys
 			ep.Fragment = fragmentOf(frag)
 			eps = append(eps, ep)
 		}
 	}
-	add(0, c.Server, c.Servers, c.SNI, c.Fingerprint, c.Reality, c.WS, c.HTTP, c.AllowInsecure, c.Fragment)
+	add(0, c.Server, c.Servers, c.SNI, c.Fingerprint, c.Reality, c.WS, c.HTTP, c.ECH, c.AllowInsecure, c.Fragment)
 	for _, b := range c.Backups {
-		add(1, b.Server, b.Servers, b.SNI, b.Fingerprint, b.Reality, b.WS, b.HTTP, b.AllowInsecure, b.Fragment)
+		add(1, b.Server, b.Servers, b.SNI, b.Fingerprint, b.Reality, b.WS, b.HTTP, b.ECH, b.AllowInsecure, b.Fragment)
 	}
 	return eps
 }

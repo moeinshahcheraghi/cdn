@@ -9,7 +9,23 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/moeinshah0/tunnel/internal/transport"
 )
+
+// checkECH validates a route's ech value.
+func checkECH(ech, realityKey string) error {
+	if ech == "" {
+		return nil
+	}
+	if realityKey != "" {
+		return fmt.Errorf("ech is for CDN/certificate routes, not reality")
+	}
+	if _, err := transport.ParseECHList(ech); err != nil {
+		return fmt.Errorf("ech: %w", err)
+	}
+	return nil
+}
 
 // mdLink matches "[text](url)": what a host looks like after being copied
 // from a chat or web page that auto-linked it. The text is what was meant.
@@ -92,6 +108,7 @@ type Backup struct {
 	Reality       RealityClientConfig `json:"reality"`
 	WS            WSClientConfig      `json:"ws"`
 	HTTP          WSClientConfig      `json:"http"`
+	ECH           string              `json:"ech"`
 	AllowInsecure bool                `json:"allow_insecure"`
 	// Fragment overrides the top-level fragment setting for this route.
 	Fragment *FragmentConfig `json:"fragment"`
@@ -198,6 +215,12 @@ type ClientConfig struct {
 	// unchanged and the traffic is ordinary downloads and uploads. The path
 	// is the server's ws.path, which accepts both.
 	HTTP WSClientConfig `json:"http"`
+	// ECH encrypts the server name so the censor sees only the CDN's shared
+	// public name (cloudflare-ech.com). The value is the domain's ECH key
+	// list: the ech= part of `dig +short HTTPS your.domain` (the whole line
+	// is accepted too). Stale keys are fine: the CDN sends its current ones
+	// and the client switches by itself. Needs fingerprint firefox.
+	ECH string `json:"ech"`
 	// Backups are alternative routes tried while the primary one fails.
 	Backups []Backup `json:"backups"`
 	// Fingerprint mimics a browser's TLS ClientHello: chrome|firefox|safari|ios|edge|random.
@@ -316,6 +339,9 @@ func LoadClient(path string) (*ClientConfig, error) {
 	if c.WS.Path != "" && c.HTTP.Path != "" {
 		return nil, fmt.Errorf("config: a route is either ws or http, not both")
 	}
+	if err := checkECH(c.ECH, c.Reality.PublicKey); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
 	for i := range c.Backups {
 		b := &c.Backups[i]
 		b.Server, b.SNI = cleanHost(b.Server), cleanHost(b.SNI)
@@ -330,6 +356,9 @@ func LoadClient(path string) (*ClientConfig, error) {
 		}
 		if b.WS.Path != "" && b.HTTP.Path != "" {
 			return nil, fmt.Errorf("config: backups[%d]: a route is either ws or http, not both", i)
+		}
+		if err := checkECH(b.ECH, b.Reality.PublicKey); err != nil {
+			return nil, fmt.Errorf("config: backups[%d]: %w", i, err)
 		}
 	}
 	if c.Server == "" && len(c.Servers) > 0 {

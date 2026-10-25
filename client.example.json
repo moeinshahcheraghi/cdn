@@ -30,6 +30,10 @@
   // WebSocket instead (the older carrier).
   // "http": { "path": "/live/stream/5f3c1a9e" },
   //
+  // Hide the domain from the censor with ECH: it then sees only
+  // cloudflare-ech.com. Value: the ech= part of `dig +short HTTPS your.domain`.
+  // "ech": "AEX+DQBB...AAA=",
+  //
   // Alternative routes, used only while the route above is failing, and
   // dropped again the moment it recovers. A CDN backup survives the exit IP
   // being blocked outright.

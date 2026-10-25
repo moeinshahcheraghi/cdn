@@ -387,6 +387,29 @@ site, so scanning finds nothing. The `http` carrier needs HTTP/2 between the
 client and the CDN (Cloudflare always offers it); it is meant for a CDN, not
 for connecting to the server directly.
 
+### Hiding the domain itself (ECH)
+
+Some networks let through only server names they already know: a new
+domain completes its TLS handshake and then stalls, on any IP and with any
+protocol inside, while a well-known site on the same CDN IP works. ECH
+(Encrypted Client Hello) takes the name out of sight: the censor sees only
+the CDN's shared public name (`cloudflare-ech.com`), and the CDN, which
+holds the key, decrypts the real one and routes as usual. Cloudflare offers
+it on every zone. Add the domain's key list to the route:
+
+```json
+"backups": [{ "server": "cdn.example.com:8443", "sni": "cdn.example.com",
+              "http": { "path": "/live/stream/5f3c1a9e" },
+              "ech": "AEX+DQBB...AAA=" }]
+```
+
+Get the value with `dig +short HTTPS cdn.example.com` and copy what follows
+`ech=` (the whole line is accepted too). Cloudflare rotates these keys; a
+stale one costs one extra handshake, in which Cloudflare sends its current
+keys (checked against the public name's certificate) and the client uses
+them from then on. ECH needs the `firefox` fingerprint. Nothing changes on
+the server.
+
 ## Routes and failover
 
 `server`, `servers` and `backups` together describe every way to reach the

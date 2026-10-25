@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,9 @@ type Endpoint struct {
 	// HTTP, when set, carries the stream in plain HTTP/2 requests through a
 	// CDN instead (see package httpconn); its fields mean the same as WS's.
 	HTTP *WSClient
+	// ECH, when set, encrypts the server name (see ech.go); the censor then
+	// sees only the CDN's public name. Certificate TLS routes only.
+	ECH *ECH
 	// Fragment, when set, splits the ClientHello (see fragment.go).
 	Fragment *Fragment
 	// Tier orders endpoints: a higher tier is used only while every endpoint
@@ -58,6 +62,9 @@ func (e *Endpoint) String() string {
 		mode = "ws"
 	case e.HTTP != nil:
 		mode = "http"
+	}
+	if e.ECH != nil {
+		mode += ", ech"
 	}
 	if e.Fragment != nil {
 		mode += ", fragment"
@@ -264,25 +271,26 @@ func (d *Dialer) handshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp s
 		return conn, err
 	}
 
-	cfg := &utls.Config{
-		ServerName:         ep.SNI,
-		InsecureSkipVerify: ep.AllowInsecure,
-		NextProtos:         []string{"h2", "http/1.1"},
-	}
-	var uconn *utls.UConn
-	if ep.WS != nil {
-		// A browser opening a WebSocket offers only http/1.1, and the upgrade
-		// below needs it: over h2 the CDN would expect an HTTP/2 request.
-		cfg.NextProtos = []string{"http/1.1"}
-		var err error
-		if uconn, err = http1Client(raw, cfg, fp); err != nil {
+	uconn, err := tlsHandshake(ctx, raw, ep, fp)
+	if err != nil && ep.ECH != nil && ep.ECH.update(err) {
+		// The CDN has rotated its ECH keys and sent the current ones; the
+		// refused handshake cannot continue, so start over with them.
+		raw2, derr := d.dialRaw(ctx, ep)
+		if derr != nil {
 			return nil, err
 		}
-	} else {
-		uconn = utls.UClient(raw, cfg, clientHelloID(fp))
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = raw2.SetDeadline(deadline)
+		}
+		if uconn, err = tlsHandshake(ctx, raw2, ep, fp); err != nil {
+			raw2.Close()
+			return nil, err
+		}
+		raw.Close()
+		_ = raw2.SetDeadline(time.Time{})
 	}
-	if err := uconn.HandshakeContext(ctx); err != nil {
-		return nil, fmt.Errorf("transport: tls handshake: %w", err)
+	if err != nil {
+		return nil, err
 	}
 	if ep.HTTP != nil {
 		// The browser's own hello, h2 and all, goes out unchanged; the CDN
@@ -312,6 +320,46 @@ func (d *Dialer) handshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp s
 		return nil, fmt.Errorf("transport: %w", err)
 	}
 	return ws, nil
+}
+
+// tlsHandshake runs certificate TLS over raw with fingerprint fp, offering
+// ECH when ep has keys for it.
+func tlsHandshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp string) (*utls.UConn, error) {
+	cfg := &utls.Config{
+		ServerName:         ep.SNI,
+		InsecureSkipVerify: ep.AllowInsecure,
+		NextProtos:         []string{"h2", "http/1.1"},
+	}
+	if ep.ECH != nil {
+		cfg.EncryptedClientHelloConfigList = ep.ECH.get()
+		cfg.EncryptedClientHelloRejectionVerify = deferRejection
+	}
+	var uconn *utls.UConn
+	if ep.WS != nil {
+		// A browser opening a WebSocket offers only http/1.1, and the upgrade
+		// needs it: over h2 the CDN would expect an HTTP/2 request.
+		cfg.NextProtos = []string{"http/1.1"}
+		var err error
+		if uconn, err = http1Client(raw, cfg, fp); err != nil {
+			return nil, err
+		}
+	} else {
+		uconn = utls.UClient(raw, cfg, clientHelloID(fp))
+	}
+	if err := uconn.HandshakeContext(ctx); err != nil {
+		var rej *utls.ECHRejectionError
+		if ep.ECH != nil && errors.As(err, &rej) {
+			if verr := ep.ECH.checkRejection(uconn.ConnectionState().PeerCertificates); verr != nil {
+				return nil, fmt.Errorf("transport: %w", verr)
+			}
+			return nil, err // verified: the caller may adopt the new keys
+		}
+		if ep.ECH != nil && strings.Contains(err.Error(), "EncryptedClientHelloExtension not present") {
+			return nil, fmt.Errorf("transport: fingerprint %q cannot carry ech; use firefox", fp)
+		}
+		return nil, fmt.Errorf("transport: tls handshake: %w", err)
+	}
+	return uconn, nil
 }
 
 // http1Client is utls.UClient with the fingerprint's ALPN list reduced to
