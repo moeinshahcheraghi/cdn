@@ -199,6 +199,11 @@ type ClientConfig struct {
 	// each new connection picks one at random, spreading traffic over more
 	// than one IP so no single one carries a suspicious volume.
 	Servers []string `json:"servers"`
+	// AutoIP keeps all new connections on one address of Servers, starting
+	// with the first, and moves to another only when tests show the current
+	// one has a real problem and the other does not. Without it each new
+	// connection picks an address at random. Needs mux and at least two servers.
+	AutoIP bool `json:"auto_ip"`
 	// Password must match one server password.
 	Password string `json:"password"`
 	// SNI presented in the TLS handshake; should match the server cert's name,
@@ -415,6 +420,12 @@ func LoadClient(path string) (*ClientConfig, error) {
 		if c.Mux.RotateMB == 0 {
 			c.Mux.RotateMB = 256
 		}
+	}
+	if c.AutoIP && !c.Mux.Enabled {
+		return nil, fmt.Errorf("config: auto_ip needs mux to be enabled")
+	}
+	if c.AutoIP && len(c.Servers) < 2 {
+		return nil, fmt.Errorf("config: auto_ip needs at least two addresses in servers")
 	}
 	if c.Log == "" {
 		c.Log = "info"

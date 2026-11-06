@@ -45,6 +45,7 @@ type Endpoint struct {
 	fails     int
 	downUntil time.Time
 	probing   bool
+	lastStall time.Time
 }
 
 // WSClient configures the WebSocket (or HTTP) wrapping of an endpoint.
@@ -79,9 +80,51 @@ const attemptTimeout = 8 * time.Second
 // Dialer establishes browser-looking connections to the tunnel server over
 // whichever endpoint currently works.
 type Dialer struct {
-	mu  sync.Mutex
-	eps []*Endpoint
-	tcp net.Dialer
+	mu     sync.Mutex
+	eps    []*Endpoint
+	tcp    net.Dialer
+	active *Endpoint // when set, new connections go here while it works
+	// While set, a connection through active has just gone silent, so do not
+	// wait long on a dial before trying another address too.
+	suspectUntil time.Time
+}
+
+// suspectFor is how long one silent connection makes the active address suspect.
+const suspectFor = 30 * time.Second
+
+// suspectHedgeDelay replaces hedgeDelay while the active address is suspect.
+const suspectHedgeDelay = 300 * time.Millisecond
+
+// Suspect notes that a connection through the active address went silent.
+func (d *Dialer) Suspect() {
+	d.mu.Lock()
+	d.suspectUntil = time.Now().Add(suspectFor)
+	d.mu.Unlock()
+}
+
+// Suspected reports whether a connection through the active address went silent
+// moments ago.
+func (d *Dialer) Suspected() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return time.Now().Before(d.suspectUntil)
+}
+
+// SetActive makes ep the endpoint new connections use while it works, instead
+// of a random one, and leaves judging it to the caller: stalls no longer count
+// against any route.
+func (d *Dialer) SetActive(ep *Endpoint) {
+	d.mu.Lock()
+	d.active = ep
+	d.suspectUntil = time.Time{}
+	d.mu.Unlock()
+}
+
+// Active returns the endpoint set by SetActive, or nil.
+func (d *Dialer) Active() *Endpoint {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.active
 }
 
 // NewDialer builds a Dialer over eps with sensible TCP timeouts and keepalive.
@@ -109,15 +152,21 @@ func (d *Dialer) Endpoints() []*Endpoint { return d.eps }
 // than one slow connection attempt.
 func (d *Dialer) Dial(ctx context.Context) (net.Conn, error) {
 	var errs []error
-	for _, ep := range d.order() {
+	order := d.order()
+	sticky := d.Active() != nil
+	for i, ep := range order {
 		if ctx.Err() != nil {
 			break
 		}
-		actx, cancel := context.WithTimeout(ctx, attemptTimeout)
-		conn, err := d.DialEndpoint(actx, ep, "")
-		cancel()
+		// With a sticky endpoint the second attempt goes to the next address:
+		// if this one has died, a user waiting on it gets through in seconds.
+		second := ep
+		if sticky && i+1 < len(order) && order[i+1].Tier == ep.Tier {
+			second = order[i+1]
+		}
+		conn, err := d.dialHedged(ctx, ep, second)
 		if err == nil {
-			d.report(ep, nil)
+			d.report(EndpointOf(conn), nil)
 			return conn, nil
 		}
 		d.report(ep, err)
@@ -127,6 +176,68 @@ func (d *Dialer) Dial(ctx context.Context) (net.Conn, error) {
 		return nil, ctx.Err()
 	}
 	return nil, errors.Join(errs...)
+}
+
+// hedgeDelay is when a dial still unanswered gets a second attempt alongside it.
+// A dial normally takes well under a second, but a censor sometimes swallows one
+// flow while the next goes straight through, and waiting out attemptTimeout on
+// the unlucky one would be the user's wait.
+var hedgeDelay = 2500 * time.Millisecond
+
+// dialHedged dials ep, starting a second attempt through second if the first is
+// slow, and returns the first to succeed. The other is closed when it finishes.
+func (d *Dialer) dialHedged(ctx context.Context, ep, second *Endpoint) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan result, 2)
+	attempt := func(through *Endpoint) {
+		actx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		conn, err := d.DialEndpoint(actx, through, "")
+		cancel()
+		results <- result{conn, err}
+	}
+	go attempt(ep)
+	delay := hedgeDelay
+	if d.Suspected() {
+		delay = suspectHedgeDelay
+	}
+	hedge := time.NewTimer(delay)
+	defer hedge.Stop()
+	started, finished := 1, 0
+	var firstErr error
+	for {
+		select {
+		case <-hedge.C:
+			started++
+			go attempt(second)
+		case r := <-results:
+			finished++
+			if r.err == nil {
+				if finished < started {
+					go func() {
+						if late := <-results; late.err == nil {
+							late.conn.Close()
+						}
+					}()
+				}
+				return r.conn, nil
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			if finished == started {
+				if started == 2 || ctx.Err() != nil {
+					return nil, firstErr
+				}
+				// The first failed quickly; try the second now, not at the timer.
+				hedge.Stop()
+				started++
+				go attempt(second)
+			}
+		}
+	}
 }
 
 // order returns the endpoints to try: healthy ones by tier (shuffled within
@@ -162,6 +273,13 @@ func (d *Dialer) order() []*Endpoint {
 	}
 	byTier(up)
 	byTier(down)
+	for i, ep := range up {
+		if ep == d.active {
+			copy(up[1:i+1], up[:i])
+			up[0] = ep
+			break
+		}
+	}
 	return append(up, down...)
 }
 
@@ -179,10 +297,28 @@ func (d *Dialer) reprobe(ep *Endpoint) {
 	d.report(ep, err)
 }
 
-// ReportStall records that connections over ep stopped moving data after
-// the handshake, which counts against it like a failed dial.
+// stallWindow is how close together two stalls must be to count against a
+// route.
+const stallWindow = time.Minute
+
+// ReportStall records that a connection over ep stopped moving data after the
+// handshake. One stall is usually one flow being cut, and a fresh connection
+// over the same route works, so moving to a backup (which may be blocked and
+// cost a full attemptTimeout) would only make it worse. A second stall soon
+// after counts against the route like a failed dial.
 func (d *Dialer) ReportStall(ep *Endpoint) {
-	if ep != nil {
+	if ep == nil {
+		return
+	}
+	d.mu.Lock()
+	if d.active != nil {
+		d.mu.Unlock()
+		return
+	}
+	repeat := !ep.lastStall.IsZero() && time.Since(ep.lastStall) < stallWindow
+	ep.lastStall = time.Now()
+	d.mu.Unlock()
+	if repeat {
 		d.report(ep, errors.New("connection stalled"))
 	}
 }
