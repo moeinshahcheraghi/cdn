@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 
+	"github.com/moeinshah0/tunnel/internal/httpconn"
 	"github.com/moeinshah0/tunnel/internal/logx"
 	"github.com/moeinshah0/tunnel/internal/wsconn"
 )
@@ -27,6 +29,12 @@ type Endpoint struct {
 	Reality *RealityClient
 	// WS, when set, wraps the stream in a WebSocket so it can pass a CDN.
 	WS *WSClient
+	// HTTP, when set, carries the stream in plain HTTP/2 requests through a
+	// CDN instead (see package httpconn); its fields mean the same as WS's.
+	HTTP *WSClient
+	// ECH, when set, encrypts the server name (see ech.go); the censor then
+	// sees only the CDN's public name. Certificate TLS routes only.
+	ECH *ECH
 	// Fragment, when set, splits the ClientHello (see fragment.go).
 	Fragment *Fragment
 	// Tier orders endpoints: a higher tier is used only while every endpoint
@@ -37,9 +45,10 @@ type Endpoint struct {
 	fails     int
 	downUntil time.Time
 	probing   bool
+	lastStall time.Time
 }
 
-// WSClient configures the WebSocket wrapping of an endpoint.
+// WSClient configures the WebSocket (or HTTP) wrapping of an endpoint.
 type WSClient struct {
 	Path string // must equal the server's ws.path
 	Host string // Host header; defaults to the SNI
@@ -52,6 +61,11 @@ func (e *Endpoint) String() string {
 		mode = "reality"
 	case e.WS != nil:
 		mode = "ws"
+	case e.HTTP != nil:
+		mode = "http"
+	}
+	if e.ECH != nil {
+		mode += ", ech"
 	}
 	if e.Fragment != nil {
 		mode += ", fragment"
@@ -66,9 +80,51 @@ const attemptTimeout = 8 * time.Second
 // Dialer establishes browser-looking connections to the tunnel server over
 // whichever endpoint currently works.
 type Dialer struct {
-	mu  sync.Mutex
-	eps []*Endpoint
-	tcp net.Dialer
+	mu     sync.Mutex
+	eps    []*Endpoint
+	tcp    net.Dialer
+	active *Endpoint // when set, new connections go here while it works
+	// While set, a connection through active has just gone silent, so do not
+	// wait long on a dial before trying another address too.
+	suspectUntil time.Time
+}
+
+// suspectFor is how long one silent connection makes the active address suspect.
+const suspectFor = 30 * time.Second
+
+// suspectHedgeDelay replaces hedgeDelay while the active address is suspect.
+const suspectHedgeDelay = 300 * time.Millisecond
+
+// Suspect notes that a connection through the active address went silent.
+func (d *Dialer) Suspect() {
+	d.mu.Lock()
+	d.suspectUntil = time.Now().Add(suspectFor)
+	d.mu.Unlock()
+}
+
+// Suspected reports whether a connection through the active address went silent
+// moments ago.
+func (d *Dialer) Suspected() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return time.Now().Before(d.suspectUntil)
+}
+
+// SetActive makes ep the endpoint new connections use while it works, instead
+// of a random one, and leaves judging it to the caller: stalls no longer count
+// against any route.
+func (d *Dialer) SetActive(ep *Endpoint) {
+	d.mu.Lock()
+	d.active = ep
+	d.suspectUntil = time.Time{}
+	d.mu.Unlock()
+}
+
+// Active returns the endpoint set by SetActive, or nil.
+func (d *Dialer) Active() *Endpoint {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.active
 }
 
 // NewDialer builds a Dialer over eps with sensible TCP timeouts and keepalive.
@@ -96,15 +152,21 @@ func (d *Dialer) Endpoints() []*Endpoint { return d.eps }
 // than one slow connection attempt.
 func (d *Dialer) Dial(ctx context.Context) (net.Conn, error) {
 	var errs []error
-	for _, ep := range d.order() {
+	order := d.order()
+	sticky := d.Active() != nil
+	for i, ep := range order {
 		if ctx.Err() != nil {
 			break
 		}
-		actx, cancel := context.WithTimeout(ctx, attemptTimeout)
-		conn, err := d.DialEndpoint(actx, ep, "")
-		cancel()
+		// With a sticky endpoint the second attempt goes to the next address:
+		// if this one has died, a user waiting on it gets through in seconds.
+		second := ep
+		if sticky && i+1 < len(order) && order[i+1].Tier == ep.Tier {
+			second = order[i+1]
+		}
+		conn, err := d.dialHedged(ctx, ep, second)
 		if err == nil {
-			d.report(ep, nil)
+			d.report(EndpointOf(conn), nil)
 			return conn, nil
 		}
 		d.report(ep, err)
@@ -114,6 +176,68 @@ func (d *Dialer) Dial(ctx context.Context) (net.Conn, error) {
 		return nil, ctx.Err()
 	}
 	return nil, errors.Join(errs...)
+}
+
+// hedgeDelay is when a dial still unanswered gets a second attempt alongside it.
+// A dial normally takes well under a second, but a censor sometimes swallows one
+// flow while the next goes straight through, and waiting out attemptTimeout on
+// the unlucky one would be the user's wait.
+var hedgeDelay = 2500 * time.Millisecond
+
+// dialHedged dials ep, starting a second attempt through second if the first is
+// slow, and returns the first to succeed. The other is closed when it finishes.
+func (d *Dialer) dialHedged(ctx context.Context, ep, second *Endpoint) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan result, 2)
+	attempt := func(through *Endpoint) {
+		actx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		conn, err := d.DialEndpoint(actx, through, "")
+		cancel()
+		results <- result{conn, err}
+	}
+	go attempt(ep)
+	delay := hedgeDelay
+	if d.Suspected() {
+		delay = suspectHedgeDelay
+	}
+	hedge := time.NewTimer(delay)
+	defer hedge.Stop()
+	started, finished := 1, 0
+	var firstErr error
+	for {
+		select {
+		case <-hedge.C:
+			started++
+			go attempt(second)
+		case r := <-results:
+			finished++
+			if r.err == nil {
+				if finished < started {
+					go func() {
+						if late := <-results; late.err == nil {
+							late.conn.Close()
+						}
+					}()
+				}
+				return r.conn, nil
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			if finished == started {
+				if started == 2 || ctx.Err() != nil {
+					return nil, firstErr
+				}
+				// The first failed quickly; try the second now, not at the timer.
+				hedge.Stop()
+				started++
+				go attempt(second)
+			}
+		}
+	}
 }
 
 // order returns the endpoints to try: healthy ones by tier (shuffled within
@@ -149,6 +273,13 @@ func (d *Dialer) order() []*Endpoint {
 	}
 	byTier(up)
 	byTier(down)
+	for i, ep := range up {
+		if ep == d.active {
+			copy(up[1:i+1], up[:i])
+			up[0] = ep
+			break
+		}
+	}
 	return append(up, down...)
 }
 
@@ -166,10 +297,28 @@ func (d *Dialer) reprobe(ep *Endpoint) {
 	d.report(ep, err)
 }
 
-// ReportStall records that connections over ep stopped moving data after
-// the handshake, which counts against it like a failed dial.
+// stallWindow is how close together two stalls must be to count against a
+// route.
+const stallWindow = time.Minute
+
+// ReportStall records that a connection over ep stopped moving data after the
+// handshake. One stall is usually one flow being cut, and a fresh connection
+// over the same route works, so moving to a backup (which may be blocked and
+// cost a full attemptTimeout) would only make it worse. A second stall soon
+// after counts against the route like a failed dial.
 func (d *Dialer) ReportStall(ep *Endpoint) {
-	if ep != nil {
+	if ep == nil {
+		return
+	}
+	d.mu.Lock()
+	if d.active != nil {
+		d.mu.Unlock()
+		return
+	}
+	repeat := !ep.lastStall.IsZero() && time.Since(ep.lastStall) < stallWindow
+	ep.lastStall = time.Now()
+	d.mu.Unlock()
+	if repeat {
 		d.report(ep, errors.New("connection stalled"))
 	}
 }
@@ -258,25 +407,42 @@ func (d *Dialer) handshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp s
 		return conn, err
 	}
 
-	cfg := &utls.Config{
-		ServerName:         ep.SNI,
-		InsecureSkipVerify: ep.AllowInsecure,
-		NextProtos:         []string{"h2", "http/1.1"},
-	}
-	var uconn *utls.UConn
-	if ep.WS != nil {
-		// A browser opening a WebSocket offers only http/1.1, and the upgrade
-		// below needs it: over h2 the CDN would expect an HTTP/2 request.
-		cfg.NextProtos = []string{"http/1.1"}
-		var err error
-		if uconn, err = http1Client(raw, cfg, fp); err != nil {
+	uconn, err := tlsHandshake(ctx, raw, ep, fp)
+	if err != nil && ep.ECH != nil && ep.ECH.update(err) {
+		// The CDN has rotated its ECH keys and sent the current ones; the
+		// refused handshake cannot continue, so start over with them.
+		raw2, derr := d.dialRaw(ctx, ep)
+		if derr != nil {
 			return nil, err
 		}
-	} else {
-		uconn = utls.UClient(raw, cfg, clientHelloID(fp))
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = raw2.SetDeadline(deadline)
+		}
+		if uconn, err = tlsHandshake(ctx, raw2, ep, fp); err != nil {
+			raw2.Close()
+			return nil, err
+		}
+		raw.Close()
+		_ = raw2.SetDeadline(time.Time{})
 	}
-	if err := uconn.HandshakeContext(ctx); err != nil {
-		return nil, fmt.Errorf("transport: tls handshake: %w", err)
+	if err != nil {
+		return nil, err
+	}
+	if ep.HTTP != nil {
+		// The browser's own hello, h2 and all, goes out unchanged; the CDN
+		// must then pick h2, as every major one does.
+		if p := uconn.ConnectionState().NegotiatedProtocol; p != "h2" {
+			return nil, fmt.Errorf("transport: http route needs HTTP/2 from the CDN, got %q", p)
+		}
+		host := ep.HTTP.Host
+		if host == "" {
+			host = ep.SNI
+		}
+		hc, err := httpconn.Dial(ctx, uconn, host, ep.HTTP.Path)
+		if err != nil {
+			return nil, fmt.Errorf("transport: %w", err)
+		}
+		return hc, nil
 	}
 	if ep.WS == nil {
 		return uconn, nil
@@ -290,6 +456,46 @@ func (d *Dialer) handshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp s
 		return nil, fmt.Errorf("transport: %w", err)
 	}
 	return ws, nil
+}
+
+// tlsHandshake runs certificate TLS over raw with fingerprint fp, offering
+// ECH when ep has keys for it.
+func tlsHandshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp string) (*utls.UConn, error) {
+	cfg := &utls.Config{
+		ServerName:         ep.SNI,
+		InsecureSkipVerify: ep.AllowInsecure,
+		NextProtos:         []string{"h2", "http/1.1"},
+	}
+	if ep.ECH != nil {
+		cfg.EncryptedClientHelloConfigList = ep.ECH.get()
+		cfg.EncryptedClientHelloRejectionVerify = deferRejection
+	}
+	var uconn *utls.UConn
+	if ep.WS != nil {
+		// A browser opening a WebSocket offers only http/1.1, and the upgrade
+		// needs it: over h2 the CDN would expect an HTTP/2 request.
+		cfg.NextProtos = []string{"http/1.1"}
+		var err error
+		if uconn, err = http1Client(raw, cfg, fp); err != nil {
+			return nil, err
+		}
+	} else {
+		uconn = utls.UClient(raw, cfg, clientHelloID(fp))
+	}
+	if err := uconn.HandshakeContext(ctx); err != nil {
+		var rej *utls.ECHRejectionError
+		if ep.ECH != nil && errors.As(err, &rej) {
+			if verr := ep.ECH.checkRejection(uconn.ConnectionState().PeerCertificates); verr != nil {
+				return nil, fmt.Errorf("transport: %w", verr)
+			}
+			return nil, err // verified: the caller may adopt the new keys
+		}
+		if ep.ECH != nil && strings.Contains(err.Error(), "EncryptedClientHelloExtension not present") {
+			return nil, fmt.Errorf("transport: fingerprint %q cannot carry ech; use firefox", fp)
+		}
+		return nil, fmt.Errorf("transport: tls handshake: %w", err)
+	}
+	return uconn, nil
 }
 
 // http1Client is utls.UClient with the fingerprint's ALPN list reduced to

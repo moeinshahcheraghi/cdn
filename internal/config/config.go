@@ -9,7 +9,23 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/moeinshah0/tunnel/internal/transport"
 )
+
+// checkECH validates a route's ech value.
+func checkECH(ech, realityKey string) error {
+	if ech == "" {
+		return nil
+	}
+	if realityKey != "" {
+		return fmt.Errorf("ech is for CDN/certificate routes, not reality")
+	}
+	if _, err := transport.ParseECHList(ech); err != nil {
+		return fmt.Errorf("ech: %w", err)
+	}
+	return nil
+}
 
 // mdLink matches "[text](url)": what a host looks like after being copied
 // from a chat or web page that auto-linked it. The text is what was meant.
@@ -91,6 +107,8 @@ type Backup struct {
 	Fingerprint   string              `json:"fingerprint"`
 	Reality       RealityClientConfig `json:"reality"`
 	WS            WSClientConfig      `json:"ws"`
+	HTTP          WSClientConfig      `json:"http"`
+	ECH           string              `json:"ech"`
 	AllowInsecure bool                `json:"allow_insecure"`
 	// Fragment overrides the top-level fragment setting for this route.
 	Fragment *FragmentConfig `json:"fragment"`
@@ -181,6 +199,11 @@ type ClientConfig struct {
 	// each new connection picks one at random, spreading traffic over more
 	// than one IP so no single one carries a suspicious volume.
 	Servers []string `json:"servers"`
+	// AutoIP keeps all new connections on one address of Servers, starting
+	// with the first, and moves to another only when tests show the current
+	// one has a real problem and the other does not. Without it each new
+	// connection picks an address at random. Needs mux and at least two servers.
+	AutoIP bool `json:"auto_ip"`
 	// Password must match one server password.
 	Password string `json:"password"`
 	// SNI presented in the TLS handshake; should match the server cert's name,
@@ -192,6 +215,17 @@ type ClientConfig struct {
 	// WS, when path is set, carries the tunnel in a WebSocket (through a CDN:
 	// server is then the CDN-proxied domain or a CDN IP, sni the domain).
 	WS WSClientConfig `json:"ws"`
+	// HTTP, when path is set, carries the tunnel in plain HTTP/2 requests
+	// through a CDN instead of a WebSocket: the browser's TLS hello goes out
+	// unchanged and the traffic is ordinary downloads and uploads. The path
+	// is the server's ws.path, which accepts both.
+	HTTP WSClientConfig `json:"http"`
+	// ECH encrypts the server name so the censor sees only the CDN's shared
+	// public name (cloudflare-ech.com). The value is the domain's ECH key
+	// list: the ech= part of `dig +short HTTPS your.domain` (the whole line
+	// is accepted too). Stale keys are fine: the CDN sends its current ones
+	// and the client switches by itself. Needs fingerprint firefox.
+	ECH string `json:"ech"`
 	// Backups are alternative routes tried while the primary one fails.
 	Backups []Backup `json:"backups"`
 	// Fingerprint mimics a browser's TLS ClientHello: chrome|firefox|safari|ios|edge|random.
@@ -304,8 +338,14 @@ func LoadClient(path string) (*ClientConfig, error) {
 		c.Forwards[i].Listen = cleanHost(c.Forwards[i].Listen)
 		c.Forwards[i].Target = cleanHost(c.Forwards[i].Target)
 	}
-	if c.Reality.PublicKey != "" && c.WS.Path != "" {
-		return nil, fmt.Errorf("config: reality and ws cannot be combined on one route; put the ws route in backups")
+	if c.Reality.PublicKey != "" && (c.WS.Path != "" || c.HTTP.Path != "") {
+		return nil, fmt.Errorf("config: reality and ws/http cannot be combined on one route; put the CDN route in backups")
+	}
+	if c.WS.Path != "" && c.HTTP.Path != "" {
+		return nil, fmt.Errorf("config: a route is either ws or http, not both")
+	}
+	if err := checkECH(c.ECH, c.Reality.PublicKey); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
 	}
 	for i := range c.Backups {
 		b := &c.Backups[i]
@@ -316,8 +356,14 @@ func LoadClient(path string) (*ClientConfig, error) {
 		if b.Server == "" && len(b.Servers) == 0 {
 			return nil, fmt.Errorf("config: backups[%d]: server is required", i)
 		}
-		if b.Reality.PublicKey != "" && b.WS.Path != "" {
-			return nil, fmt.Errorf("config: backups[%d]: reality and ws cannot be combined", i)
+		if b.Reality.PublicKey != "" && (b.WS.Path != "" || b.HTTP.Path != "") {
+			return nil, fmt.Errorf("config: backups[%d]: reality and ws/http cannot be combined", i)
+		}
+		if b.WS.Path != "" && b.HTTP.Path != "" {
+			return nil, fmt.Errorf("config: backups[%d]: a route is either ws or http, not both", i)
+		}
+		if err := checkECH(b.ECH, b.Reality.PublicKey); err != nil {
+			return nil, fmt.Errorf("config: backups[%d]: %w", i, err)
 		}
 	}
 	if c.Server == "" && len(c.Servers) > 0 {
@@ -374,6 +420,12 @@ func LoadClient(path string) (*ClientConfig, error) {
 		if c.Mux.RotateMB == 0 {
 			c.Mux.RotateMB = 256
 		}
+	}
+	if c.AutoIP && !c.Mux.Enabled {
+		return nil, fmt.Errorf("config: auto_ip needs mux to be enabled")
+	}
+	if c.AutoIP && len(c.Servers) < 2 {
+		return nil, fmt.Errorf("config: auto_ip needs at least two addresses in servers")
 	}
 	if c.Log == "" {
 		c.Log = "info"

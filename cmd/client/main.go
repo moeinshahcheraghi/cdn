@@ -152,7 +152,7 @@ func runDiag(cfg *config.ClientConfig) int {
 		}
 	}
 	if worked == 0 {
-		fmt.Printf("\nNo route handshakes. The exit IP looks blocked from here: add a CDN backup route (ws) or another exit to \"servers\".\n")
+		fmt.Printf("\nNo route handshakes. The exit IP looks blocked from here: add a CDN backup route (http or ws) or another exit to \"servers\".\n")
 		return 1
 	}
 	// Full tunnel check with the configured settings: a stream that the
@@ -195,6 +195,7 @@ func runDiag(cfg *config.ClientConfig) int {
 				fmt.Printf("  The route lets the TLS handshake through and then drops the traffic — typical of a\n")
 				fmt.Printf("  datacenter that filters foreign IPs, or DPI cutting the flow. Protocol changes on\n")
 				fmt.Printf("  this route will not help: use another route (CDN backup, another exit, or a hop).\n")
+				fmt.Printf("  On a CDN route, try \"http\" in place of \"ws\" (same path), and other CDN IPs (cf-scan.sh).\n")
 				fmt.Printf("  (If the server log at \"debug\" shows \"fallback: serving probe\", the password differs instead.)\n")
 				st.Close()
 				return 1

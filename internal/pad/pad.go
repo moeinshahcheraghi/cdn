@@ -82,6 +82,20 @@ func (c *Conn) WriteHeader(raw []byte) error {
 	return err
 }
 
+// WritePadding sends n bytes the peer discards, in as many frames as it takes.
+func (c *Conn) WritePadding(n int) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	for n > 0 {
+		k := min(n, maxBody)
+		if _, err := c.Conn.Write(appendPad(make([]byte, 0, hdrLen+k), k)); err != nil {
+			return err
+		}
+		n -= k
+	}
+	return nil
+}
+
 // Write frames p (splitting bodies larger than a frame) and, at the start of
 // a burst, appends a padding frame; the whole thing goes out in one write so
 // it shares a TLS record.

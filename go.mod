@@ -7,6 +7,7 @@ require (
 	github.com/xtaci/smux v1.5.57
 	github.com/xtls/reality v0.0.0-20260908042918-393f8de3ee2d
 	golang.org/x/crypto v0.48.0
+	golang.org/x/net v0.49.0
 	golang.org/x/sys v0.47.0
 )
 
@@ -17,7 +18,6 @@ require (
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/pires/go-proxyproto v0.11.0 // indirect
-	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 )
 

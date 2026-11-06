@@ -22,6 +22,7 @@ func reuseControl(network, address string, c syscall.RawConn) error {
 		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 		// Inherited by accepted connections.
 		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, userTimeoutMs)
+		_ = unix.SetsockoptString(int(fd), unix.IPPROTO_TCP, unix.TCP_CONGESTION, congestion)
 	})
 	if err != nil {
 		return err
@@ -36,9 +37,15 @@ func reuseControl(network, address string, c syscall.RawConn) error {
 // and the streams are resumed elsewhere.
 const userTimeoutMs = 30000
 
+// congestion is the congestion control asked for on tunnel connections. Loss on
+// an international path makes the kernel's usual CUBIC cut its speed hard; BBR
+// does not. If the kernel lacks it, the connection keeps the system default.
+const congestion = "bbr"
+
 // clientControl applies socket options to outgoing tunnel connections.
 func clientControl(network, address string, c syscall.RawConn) error {
 	return c.Control(func(fd uintptr) {
 		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, userTimeoutMs)
+		_ = unix.SetsockoptString(int(fd), unix.IPPROTO_TCP, unix.TCP_CONGESTION, congestion)
 	})
 }

@@ -350,9 +350,18 @@ and receives its real certificate. Keep both clocks NTP-synced.
 ## Through a CDN (when the exit IP is blocked)
 
 When a datacenter cannot reach the exit at all, or its IP has been burned,
-the tunnel can travel inside an ordinary WebSocket through a CDN. The
-censored link then carries HTTPS to Cloudflare's addresses with Cloudflare's
-certificate, and the exit's own address never appears on it.
+the tunnel can travel through a CDN. The censored link then carries HTTPS to
+Cloudflare's addresses with Cloudflare's certificate, and the exit's own
+address never appears on it. Two carriers are available, both served by the
+same server setting:
+
+- `http` (preferred): plain HTTP/2 requests, one long download (`GET`) and
+  numbered uploads (`POST`) that the server puts back in order. The browser's
+  TLS hello goes out unchanged, h2 included, and the traffic is ordinary
+  requests and responses.
+- `ws`: one WebSocket. To open it the client must offer only http/1.1 in its
+  hello, which a browser talking to a CDN never does; a censor that keys on
+  that, or on long-lived bidirectional flows, stops it after the handshake.
 
 Server — a second door, since a REALITY port cannot also serve a CDN:
 
@@ -364,14 +373,42 @@ Client — usually as a backup, so the direct route is preferred while it works:
 
 ```json
 "backups": [{ "server": "cdn.example.com:8443", "sni": "cdn.example.com",
-              "ws": { "path": "/live/stream/5f3c1a9e" } }]
+              "http": { "path": "/live/stream/5f3c1a9e" } }]
 ```
 
+(`"ws": { ... }` in place of `"http"` uses the WebSocket carrier.)
+
 In Cloudflare: an A record for that name at the exit IP, proxied (orange
-cloud), SSL mode Full, WebSockets on. The client's port must be the same as
-`ws.listen` (8443 here): Cloudflare connects to the origin on the port the
-client used, and 443 would land on the REALITY port. `path` is a second secret; every other
-path on the port is served by the fallback site, so scanning finds nothing.
+cloud), SSL mode Full (and WebSockets on, for `ws`). The client's port must
+be the same as `ws.listen` (8443 here): Cloudflare connects to the origin on
+the port the client used, and 443 would land on the REALITY port. `path` is
+a second secret; every other path on the port is served by the fallback
+site, so scanning finds nothing. The `http` carrier needs HTTP/2 between the
+client and the CDN (Cloudflare always offers it); it is meant for a CDN, not
+for connecting to the server directly.
+
+### Hiding the domain itself (ECH)
+
+Some networks let through only server names they already know: a new
+domain completes its TLS handshake and then stalls, on any IP and with any
+protocol inside, while a well-known site on the same CDN IP works. ECH
+(Encrypted Client Hello) takes the name out of sight: the censor sees only
+the CDN's shared public name (`cloudflare-ech.com`), and the CDN, which
+holds the key, decrypts the real one and routes as usual. Cloudflare offers
+it on every zone. Add the domain's key list to the route:
+
+```json
+"backups": [{ "server": "cdn.example.com:8443", "sni": "cdn.example.com",
+              "http": { "path": "/live/stream/5f3c1a9e" },
+              "ech": "AEX+DQBB...AAA=" }]
+```
+
+Get the value with `dig +short HTTPS cdn.example.com` and copy what follows
+`ech=` (the whole line is accepted too). Cloudflare rotates these keys; a
+stale one costs one extra handshake, in which Cloudflare sends its current
+keys (checked against the public name's certificate) and the client uses
+them from then on. ECH needs the `firefox` fingerprint. Nothing changes on
+the server.
 
 ## Routes and failover
 

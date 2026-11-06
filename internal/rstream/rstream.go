@@ -78,7 +78,7 @@ type Stream struct {
 	sendBase     uint64
 	sentOff      uint64    // next offset to transmit on the current carrier
 	peerConsumed uint64    // highest offset the peer's application has read
-	progressAt   time.Time // last time the peer acknowledged new data, or data became outstanding
+	progressAt   time.Time // last time anything arrived from the peer, or data became outstanding
 	finOff       uint64    // valid when writeClosed
 	finSent      bool      // FIN transmitted on the current carrier
 
@@ -205,7 +205,7 @@ func (s *Stream) PeerGone() {
 }
 
 // Stalled reports whether data has been outstanding on the current carrier
-// for longer than d without the peer acknowledging any of it. The peer
+// for longer than d with nothing at all arriving from the peer. The peer
 // acknowledges receipt within ackDelay regardless of what its application
 // does, so a long silence means the carrier is black-holed or throttled to
 // nothing (censors drop packets far more often than they reset), a state TCP
@@ -275,7 +275,10 @@ func (s *Stream) Detach() {
 
 func (s *Stream) dropCarrierLocked() {
 	if s.carrier != nil {
-		s.carrier.Close()
+		// Not under the lock: closing a carrier stuck on a dead connection can
+		// wait for its transport's long timeout, and the stream has somewhere
+		// better to be.
+		go s.carrier.Close()
 		s.carrier = nil
 		s.gen++ // invalidates loops
 	}
@@ -594,6 +597,14 @@ func (s *Stream) readLoop(c net.Conn, gen int) {
 			return
 		}
 		off := binary.BigEndian.Uint64(hdr[1:])
+		// Anything arriving proves the carrier is alive. The peer's ACKs queue
+		// behind whatever it is sending us, so on a busy thin link they can be
+		// seconds late without anything being wrong.
+		s.mu.Lock()
+		if s.gen == gen {
+			s.progressAt = time.Now()
+		}
+		s.mu.Unlock()
 		switch hdr[0] {
 		case frameData:
 			if _, err := io.ReadFull(c, hdr[hdrLen:hdrLen+2]); err != nil {
