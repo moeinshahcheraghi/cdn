@@ -464,3 +464,4 @@ imitated site in REALITY mode), `reality`, `servers`, `forwards`,
 - For the strongest cover, use a real domain + valid certificate and a real
   fallback website, not the self-signed/testing defaults.
 - Use a long random password. It is the only secret protecting the server.
+# cdn
