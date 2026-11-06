@@ -2,6 +2,7 @@
 *.log
 server.json
 client.json
+.claude
 *.pem
 /server
 /client
