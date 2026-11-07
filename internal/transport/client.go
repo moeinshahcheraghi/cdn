@@ -20,6 +20,7 @@ import (
 // Endpoint is one way of reaching the tunnel server: an address plus how to
 // dress the connection (plain TLS, REALITY, or a WebSocket through a CDN).
 type Endpoint struct {
+	FakeSNI       string // optional Linux raw-packet ClientHello injection; real SNI remains unchanged
 	Server        string // host:port to connect to
 	SNI           string // ServerName to present
 	Fingerprint   string // browser to mimic
@@ -362,7 +363,7 @@ func (d *Dialer) DialEndpoint(ctx context.Context, ep *Endpoint, fp string) (net
 // dialRaw opens the TCP connection to ep, with no Nagle delay (low latency,
 // and it keeps fragmented hello pieces in separate segments).
 func (d *Dialer) dialRaw(ctx context.Context, ep *Endpoint) (net.Conn, error) {
-	raw, err := d.tcp.DialContext(ctx, "tcp", ep.Server)
+	raw, err := dialWithFakeSNI(ctx, &d.tcp, ep.Server, ep.FakeSNI)
 	if err != nil {
 		return nil, err
 	}
@@ -438,7 +439,7 @@ func (d *Dialer) handshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp s
 		if host == "" {
 			host = ep.SNI
 		}
-		hc, err := httpconn.Dial(ctx, uconn, host, ep.HTTP.Path)
+		hc, err := httpconn.Dial(ctx, uconn, host, ep.HTTP.Path, browserUserAgent(fp))
 		if err != nil {
 			return nil, fmt.Errorf("transport: %w", err)
 		}
@@ -451,7 +452,7 @@ func (d *Dialer) handshake(ctx context.Context, raw net.Conn, ep *Endpoint, fp s
 	if host == "" {
 		host = ep.SNI
 	}
-	ws, err := wsconn.Dial(uconn, host, ep.WS.Path)
+	ws, err := wsconn.Dial(uconn, host, ep.WS.Path, browserUserAgent(fp))
 	if err != nil {
 		return nil, fmt.Errorf("transport: %w", err)
 	}

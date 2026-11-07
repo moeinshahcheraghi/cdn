@@ -260,3 +260,57 @@ func TestCarrierLostCallback(t *testing.T) {
 		t.Fatal("no carrier-lost callback")
 	}
 }
+
+type blockedClose struct {
+	net.Conn
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *blockedClose) Close() error {
+	close(c.started)
+	<-c.release
+	return c.Conn.Close()
+}
+
+// A smux FIN can block while the old connection is stalled. Replacing it
+// must not hold the stream state lock or delay traffic on the new carrier.
+func TestReplacementSurvivesBlockedCarrierClose(t *testing.T) {
+	a := New(1, 5*time.Second)
+	b := New(1, 5*time.Second)
+	defer a.Close()
+	defer b.Close()
+	old, peer := tcpPair(t)
+	defer peer.Close()
+	blocked := &blockedClose{Conn: old, started: make(chan struct{}), release: make(chan struct{})}
+	defer close(blocked.release)
+	if err := a.Attach(blocked, 0); err != nil {
+		t.Fatal(err)
+	}
+	ca, cb := tcpPair(t)
+	if err := b.Attach(cb, 0); err != nil {
+		t.Fatal(err)
+	}
+	attached := make(chan error, 1)
+	go func() { attached <- a.Attach(ca, 0) }()
+	select {
+	case err := <-attached:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement waited for old carrier Close")
+	}
+	select {
+	case <-blocked.started:
+	case <-time.After(time.Second):
+		t.Fatal("old carrier was not closed")
+	}
+	msg := bytes.Repeat([]byte("replacement"), 16<<10)
+	go a.Write(msg)
+	b.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(b, got); err != nil || !bytes.Equal(got, msg) {
+		t.Fatalf("new carrier stalled while old Close blocked: %v", err)
+	}
+}

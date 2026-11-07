@@ -64,7 +64,14 @@ type Conn struct {
 
 // Dial performs the client handshake on conn (normally a TLS connection
 // negotiated with ALPN http/1.1) and returns the stream.
-func Dial(conn net.Conn, host, path string) (*Conn, error) {
+func Dial(conn net.Conn, host, path string, agent ...string) (*Conn, error) {
+	ua := UserAgent
+	if len(agent) > 0 {
+		ua = agent[0]
+	}
+	if strings.ContainsAny(ua, "\r\n") {
+		return nil, errors.New("wsconn: invalid User-Agent")
+	}
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, err
@@ -75,7 +82,7 @@ func Dial(conn net.Conn, host, path string) (*Conn, error) {
 	}
 	req := "GET " + path + " HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
-		"User-Agent: " + UserAgent + "\r\n" +
+		"User-Agent: " + ua + "\r\n" +
 		"Accept: */*\r\n" +
 		"Accept-Language: en-US,en;q=0.5\r\n" +
 		"Sec-WebSocket-Version: 13\r\n" +

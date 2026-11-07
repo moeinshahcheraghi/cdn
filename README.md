@@ -1,15 +1,17 @@
 # tunnel
 
-A high-performance, DPI-resistant tunnel. Traffic travels inside a genuine
-TLS 1.3 session whose ClientHello is copied from a real browser, so deep packet
-inspection sees only ordinary HTTPS. The server behaves like a real web server
-to anyone who is not an authenticated client, defeating active probing. There is
-no bandwidth cap; multiplexing and NoDelay keep latency low.
+A TCP tunnel carried over TLS, with browser-style ClientHello profiles,
+HTTP/2 and WebSocket CDN routes, multiplexing, and resumable streams.
+Unauthenticated connections can be forwarded to a fallback site. These features
+provide routing and traffic-shaping options; they do not make traffic
+indistinguishable from a browser or guarantee access through filtering.
 
-یک تانل پرسرعت و مقاوم در برابر DPI. ترافیک داخل یک نشست واقعی TLS 1.3 حرکت می‌کند
-که اثرانگشت آن دقیقاً مثل مرورگر کروم است، پس DPI فقط یک HTTPS معمولی می‌بیند.
-سرور برای هر کسی که کلاینت معتبر نباشد مثل یک وب‌سایت واقعی رفتار می‌کند و
-active probing را خنثی می‌کند. محدودیت پهنای‌باند وجود ندارد.
+یک تانل TCP روی TLS با پروفایل ClientHello مرورگر، مسیرهای HTTP/2 و WebSocket
+از طریق CDN، چندجریانی و ادامهٔ جریان بعد از تعویض اتصال. اتصال‌های بدون احراز
+هویت می‌توانند به سایت fallback هدایت شوند. این امکانات تضمین عبور از فیلترینگ
+یا غیرقابل‌شناسایی بودن ترافیک نیستند.
+
+راهنمای قابلیت‌های جدید و دستورهای استفاده: [آموزش فارسی](#new-features-fa).
 
 ## How it resists DPI
 
@@ -89,7 +91,8 @@ Both ports actually accept *either* protocol (auto-detected).
 کلاینت OpenVPN کاربر --> سرور ایران:2083 --> [تانل، شبیه HTTPS] --> سرور خارج:2083 (OpenVPN)
 ```
 
-روی لینک ایران به خارج، فیلترینگ فقط یک HTTPS معمولی با اثرانگشت کروم می‌بیند.
+روی لینک ایران به خارج، داده داخل TLS منتقل می‌شود؛ میزان شباهت به مرورگر و
+دسترسی‌پذیری به تنظیمات و رفتار شبکه بستگی دارد.
 
 
 ### شروع سریع با هر دامنه‌ای
@@ -441,14 +444,179 @@ nothing and the user keeps running on the old one. A stream whose header
 never reached the server is simply opened again. Nothing the application has
 written or read is ever lost or duplicated.
 
+<a id="new-features-fa"></a>
+
+## قابلیت‌های جدید و روش استفاده (فارسی)
+
+### چه چیزی تغییر کرده؟
+
+- `fake_sni` آزمایشی داخل کلاینت لینوکس اضافه شده؛ ابزار واسط جدا الزامی نیست.
+- تست echo برای بررسی انتقال واقعی داده و مقایسهٔ SHA-256 اضافه شده است.
+- اسکن Cloudflare فقط با موفقیت تست echo، یک IP را موفق اعلام می‌کند.
+- هدر `User-Agent` در مسیرهای HTTP/2 و WebSocket با خانواده و نسخهٔ پروفایل
+  TLS انتخاب‌شده هماهنگ می‌شود؛ این به معنی تقلید کامل رفتار مرورگر نیست.
+- هنگام تعویض اتصال، بسته‌شدن کند اتصال قبلی مانع ادامهٔ کار اتصال جدید نمی‌شود.
+
+### ۱. ساخت و اجرای نسخهٔ جدید
+
+برای نسخهٔ فعلی Linux، Go نسخهٔ 1.25 یا جدیدتر و ابزار `make` لازم است. در ریشهٔ مخزن:
+
+```sh
+make
+make test vet
+cp client.example.json client.json
+```
+
+در `client.json` آدرس سرور، رمز مشترک، دامنهٔ واقعی و تنظیمات مسیر خود را وارد کنید.
+فایل نمونه دارای کامنت است و کلاینت آن را می‌پذیرد. برای نصب موجود، ابتدا از
+باینری و تنظیمات قبلی نسخهٔ پشتیبان بگیرید. نسخهٔ جدید کلاینت را جایگزین کنید؛
+برای این قابلیت‌ها تغییری در قالب پروتکل یا تنظیمات سرور لازم نیست.
+
+```sh
+./bin/tunnel-client -c client.json -diag
+./bin/tunnel-client -c client.json
+```
+
+تنظیمات پایه، SOCKS و OpenVPN در بخش‌های قبلی همین README آمده است.
+
+### ۲. فعال‌کردن اختیاری fake SNI
+
+ابتدا مسیر عادی را بدون `fake_sni` تست کنید. برای یک مسیر CDN موجود، کلید زیر
+را به آبجکت همان مسیر در تنظیمات اضافه کنید؛ این قطعه یک تنظیم کامل نیست:
+
+```json
+"fake_sni": "chatgpt.com"
+```
+
+نام بالا فقط نمونهٔ آزمایشی است. `sni` و `ws.host` یا `http.host` باید همچنان
+دامنهٔ واقعی خودتان باشند؛ `server` هم آدرس مقصد واقعی است. این روش مالکیت یا
+مسیریابی دامنهٔ دیگری را به شما نمی‌دهد. هر backup مقدار `fake_sni` مستقل دارد
+و آن را از مسیر اصلی به ارث نمی‌برد.
+
+پشتیبانی فعلی Linux با Ethernet/IPv4 است و دسترسی raw socket لازم دارد:
+
+```sh
+sudo setcap cap_net_raw+ep ./bin/tunnel-client
+./bin/tunnel-client -c client.json -diag
+```
+
+دستور `setcap` از بستهٔ `libcap2-bin` در Debian/Ubuntu است. قابلیت را روی همان
+باینری‌ای اعمال کنید که اجرا می‌شود؛ بعد از ساخت مجدد یا جایگزینی فایل ممکن است
+نیاز به اجرای دوبارهٔ آن باشد. سرویس‌های محدودشده با systemd یا کانتینر هم باید
+اجازهٔ `CAP_NET_RAW` داشته باشند. خطای دسترسی یا شکست تزریق باعث شکست همان اتصال
+می‌شود. برای غیرفعال‌کردن، کلید `fake_sni` را حذف کنید و کلاینت را دوباره اجرا کنید.
+
+راهنمای فنی، روش جایگزین با forwarder و محدودیت‌ها در
+[راهنمای SNI](deploy/sni-spoof/README.md) آمده است. هنگام استفاده از forwarder
+محلی، `fake_sni` داخلی را هم‌زمان فعال نکنید.
+
+### ۳. تست واقعی ارسال و دریافت
+
+روی **سرور خروجی** یک سرویس TCP echo روی loopback اجرا کنید؛ در صورت نصب `socat`:
+
+```sh
+socat TCP4-LISTEN:19090,bind=127.0.0.1,reuseaddr,fork EXEC:cat
+```
+
+این ترمینال را باز نگه دارید. روی **ماشین کلاینت** اجرا کنید:
+
+```sh
+./bin/tunnel-client -c client.json -diag \
+  -diag-echo 127.0.0.1:19090 -diag-bytes 5242880 -diag-timeout 30s
+```
+
+آدرس `127.0.0.1:19090` در سمت سرور خروجی استفاده می‌شود، نه روی ماشین کلاینت.
+نیازی به بازکردن پورت عمومی نیست. پس از تست، سرویس echo را با `Ctrl+C` متوقف کنید.
+پورت HTTP، HTTPS یا OpenVPN جایگزین سرویس echo نیست.
+
+- `bulk echo PASSED`: دادهٔ همین تست کامل برگشته و hash آن مطابق بوده است.
+- `queued`: بایت‌های پذیرفته‌شده برای ارسال در کلاینت؛ به‌تنهایی اثبات تحویل نیست.
+- `echoed`: تعداد بایت‌های برگشتی؛ در شکست یا timeout برای تشخیص محل توقف مفید است.
+- بدون `-diag-echo`، تأیید ۱۶ KiB فقط تأیید طرف مقابل تانل است و دانلود یا
+  انتقال پایدار تا مقصد را ثابت نمی‌کند.
+
+حجم پیش‌فرض ۱ MiB و زمان پیش‌فرض ۳۰ ثانیه است. برای مقایسهٔ مسیرها، هر مسیر را
+در یک فایل جدا و بدون backup تست کنید؛ در غیر این صورت failover ممکن است تست
+را از مسیر دیگری موفق کند. موفقیت این تست علت خطاهای شبکه یا پایداری چندساعته
+را مشخص نمی‌کند.
+
+### ۴. اسکن IPهای Cloudflare با تست echo
+
+یک پوشهٔ تست جدا آماده کنید و `client.json` مناسب دامنهٔ CDN خود را در آن بگذارید.
+در این فایل کلیدهای `servers` و `backups` را کاملاً حذف کنید تا هر IP مستقل
+بررسی شود. باینری باید کنار فایل تنظیمات قرار بگیرد:
+
+```sh
+mkdir -p work/cf-scan
+cp bin/tunnel-client work/cf-scan/
+# Put your edited, single-route client.json in work/cf-scan/ first.
+# Put candidate IPs in work/cf-scan/ips.txt, one per line.
+cd work/cf-scan
+DIAG_ECHO_TARGET=127.0.0.1:19090 DIAG_BYTES=5242880 DIAG_TIMEOUT=30s \
+  bash ../../scripts/cf-scan.sh ips.txt 8443
+```
+
+پورت `8443` را با پورت واقعی مسیر CDN عوض کنید. سرویس echo مرحلهٔ قبل باید روی
+خروجی فعال باشد. تنها `OK` به معنی موفقیت انتقال echo است؛ بدون
+`DIAG_ECHO_TARGET` اسکن فقط بررسی محدود انجام می‌دهد و فهرست IP موفق نمی‌سازد.
+
+### وضعیت اعتبارسنجی
+
+تست‌های خودکار و آزمایش‌های محلی در
+[گزارش تست](deploy/sni-spoof/TEST-RESULTS.md) و
+[گزارش DPI](deploy/sni-spoof/DPI-REVIEW.md) توضیح داده شده‌اند. رفتار واقعی
+Cloudflare، شبکهٔ ایران و پایداری چندساعته هنوز نیاز به تست میدانی دارند.
+
 ## Diagnostics
+
+Experimental native Linux fake-SNI injection is documented in
+[the SNI integration guide](deploy/sni-spoof/README.md). It is disabled by
+default and requires `CAP_NET_RAW`. See the [DPI lab report](deploy/sni-spoof/DPI-REVIEW.md)
+for tested visibility limits on direct, WebSocket and HTTP/2 routes. Neither
+fake SNI nor fragmentation guarantees access through a whitelist.
 
 `tunnel-client -c client.json -diag` tests every configured route in turn:
 TCP connect, the handshake with each browser fingerprint (printing each
 ClientHello's size, since hellos over one packet are dropped by some
 censors), the clock against the imitated site in REALITY mode, and finally a
-real tunnel stream. A failing datacenter is classified in seconds — blocked
-IP, blocked port, wrong SNI or fingerprint, wrong clock, or wrong password.
+real tunnel stream. Errors locate the failing stage; they do not prove that
+DPI, an IP block, or a domain allowlist caused the failure. The default mux
+probe checks only whether the tunnel peer acknowledges 16 KiB. It does not
+verify delivery to the destination, download traffic, or sustained throughput.
+
+For a verified bulk test, run a TCP echo service you control on the exit
+machine, bound to loopback (for example `127.0.0.1:19090`), then run:
+
+```sh
+tunnel-client -c client.json -diag -diag-echo 127.0.0.1:19090 \
+  -diag-bytes 5242880 -diag-timeout 30s
+```
+
+The echo address is resolved on the exit server. It must be an actual TCP echo
+service, not an HTTP, HTTPS, or OpenVPN listener. For example, if `socat` is
+installed on the exit, start `socat TCP4-LISTEN:19090,bind=127.0.0.1,reuseaddr,fork EXEC:cat`
+and stop it after testing. No public echo port is needed.
+
+This sends random data and concurrently reads it back, compares SHA-256
+digests, and reports locally queued versus returned bytes even on timeout.
+The default bulk size is 1 MiB; increase it above the cutoff you observed.
+A pass verifies that transfer size over the configured routing, which includes
+failover and stream migration. Test each route in a separate config to compare
+direct and CDN paths. Neither a pass nor a failure identifies a filtering policy.
+For `scripts/cf-scan.sh`, set `DIAG_ECHO_TARGET=127.0.0.1:19090` (and optionally
+`DIAG_BYTES` / `DIAG_TIMEOUT`) to enable this check. Remove backups from the
+test config when comparing individual CDN addresses, so failover cannot mask a
+failing candidate. Without an echo target the scanner reports limited probes
+and does not list addresses as bulk-transfer successes.
+
+A successful TLS handshake or WebSocket `101` alone does not establish that
+application data can flow. If ordinary HTTP to the same domain or IP also stops
+while a known working control destination succeeds, compare server logs and
+repeat controlled transfers before changing TLS fingerprints. An arbitrary
+SNI is not a replacement for a working route: certificate TLS needs a matching
+certificate, REALITY needs a configured server name and authentication, and CDN
+routing must accept the requested host. Fragmentation or connection rotation
+does not guarantee access through destination-based restrictions.
 
 ## Putting OpenVPN (or any TCP service) behind the tunnel
 

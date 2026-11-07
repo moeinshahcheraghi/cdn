@@ -26,7 +26,14 @@ import (
 func main() {
 	cfgPath := flag.String("c", "client.json", "path to client config JSON")
 	diag := flag.Bool("diag", false, "test connectivity to the server(s) and exit")
+	diagEcho := flag.String("diag-echo", "", "host:port of a TCP echo service you control on the exit side; enables verified bulk transfer with -diag")
+	diagBytes := flag.Int64("diag-bytes", 1<<20, "bytes to send and verify with -diag-echo")
+	diagTimeout := flag.Duration("diag-timeout", 30*time.Second, "time limit for opening and testing the bulk echo stream")
 	flag.Parse()
+	if *diagBytes <= 0 || *diagTimeout <= 0 || (*diagEcho != "" && !*diag) {
+		fmt.Fprintln(os.Stderr, "diagnostic sizes and timeouts must be positive; -diag-echo requires -diag")
+		os.Exit(2)
+	}
 
 	cfg, err := config.LoadClient(*cfgPath)
 	if err != nil {
@@ -35,7 +42,7 @@ func main() {
 	}
 	logx.SetLevel(cfg.Log)
 	if *diag {
-		os.Exit(runDiag(cfg))
+		os.Exit(runDiag(cfg, *diagEcho, *diagBytes, *diagTimeout))
 	}
 
 	client := tunnel.NewClient(cfg)
@@ -93,10 +100,14 @@ func acceptLoop(ln net.Listener, client *tunnel.Client) {
 }
 
 // runDiag reports, stage by stage, whether and how fast each route can be
-// reached, so a failing datacenter can be classified in seconds: TCP blocked
-// (the IP is filtered), handshake dropped (SNI/fingerprint/port), clock wrong
-// (REALITY rejects the token), or the tunnel itself refused (password/keys).
-func runDiag(cfg *config.ClientConfig) int {
+// reached. Failures locate a stage; they do not establish filtering as the cause.
+func runDiag(cfg *config.ClientConfig, echoTarget string, probeBytes int64, probeTimeout time.Duration) int {
+	if echoTarget != "" {
+		if _, err := parseTarget(echoTarget); err != nil {
+			fmt.Printf("bulk echo: invalid target: %v\n", err)
+			return 1
+		}
+	}
 	eps := tunnel.Endpoints(cfg)
 	fmt.Printf("clock: %s\n", time.Now().Format(time.RFC1123))
 	for _, fp := range transport.Fingerprints {
@@ -152,7 +163,7 @@ func runDiag(cfg *config.ClientConfig) int {
 		}
 	}
 	if worked == 0 {
-		fmt.Printf("\nNo route handshakes. The exit IP looks blocked from here: add a CDN backup route (http or ws) or another exit to \"servers\".\n")
+		fmt.Printf("\nNo route completed a handshake. Check reachability, TLS settings, keys, and server logs; this does not establish IP blocking.\n")
 		return 1
 	}
 	// Full tunnel check with the configured settings: a stream that the
@@ -162,6 +173,9 @@ func runDiag(cfg *config.ClientConfig) int {
 	if len(cfg.Forwards) > 0 {
 		target = cfg.Forwards[0].Target
 	}
+	if echoTarget != "" {
+		target = echoTarget
+	}
 	addr, err := parseTarget(target)
 	if err != nil {
 		fmt.Printf("tunnel check: bad target %s\n", target)
@@ -169,13 +183,29 @@ func runDiag(cfg *config.ClientConfig) int {
 	}
 	c := tunnel.NewClient(cfg)
 	defer c.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	openTimeout := 20 * time.Second
+	if echoTarget != "" {
+		openTimeout = probeTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), openTimeout)
 	defer cancel()
 	t0 := time.Now()
 	st, err := c.OpenStream(ctx, addr)
 	if err != nil {
 		fmt.Printf("tunnel check: open stream to %s FAILED: %v\n", target, err)
 		return 1
+	}
+	defer st.Close()
+	if echoTarget != "" {
+		result, err := probeEcho(ctx, st, probeBytes)
+		fmt.Printf("bulk echo via configured routes (including failover): target=%s queued=%d echoed=%d expected=%d elapsed=%v\n",
+			target, result.sent, result.received, probeBytes, time.Since(t0).Round(time.Millisecond))
+		if err != nil {
+			fmt.Printf("bulk echo FAILED: %v. Check the echo service, server logs, and route; this test does not identify DPI or a whitelist.\n", err)
+			return 1
+		}
+		fmt.Printf("bulk echo PASSED: payload integrity verified in both directions for this transfer size. Larger or longer transfers may behave differently.\n")
+		return failed
 	}
 	opened := time.Since(t0)
 	// An open stream proves only the handshake. A censor that lets the
@@ -191,18 +221,14 @@ func runDiag(cfg *config.ClientConfig) int {
 		}
 		for acker.Acked() < uint64(len(probe)) {
 			if time.Since(t1) > 10*time.Second {
-				fmt.Printf("tunnel check: handshake OK but 16 KB of data got NO acknowledgement in 10s.\n")
-				fmt.Printf("  The route lets the TLS handshake through and then drops the traffic — typical of a\n")
-				fmt.Printf("  datacenter that filters foreign IPs, or DPI cutting the flow. Protocol changes on\n")
-				fmt.Printf("  this route will not help: use another route (CDN backup, another exit, or a hop).\n")
-				fmt.Printf("  On a CDN route, try \"http\" in place of \"ws\" (same path), and other CDN IPs (cf-scan.sh).\n")
-				fmt.Printf("  (If the server log at \"debug\" shows \"fallback: serving probe\", the password differs instead.)\n")
+				fmt.Printf("tunnel check: 16 KB probe not fully acknowledged in 10s (acked=%d).\n", acker.Acked())
+				fmt.Printf("  Possible causes include authentication, target availability, server faults, or route restrictions. Inspect server logs and use -diag-echo with a TCP echo service you control.\n")
 				st.Close()
 				return 1
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		fmt.Printf("tunnel check: data path OK, 16 KB acknowledged in %v\n", time.Since(t1).Round(time.Millisecond))
+		fmt.Printf("tunnel check: only 16 KB acknowledged by the tunnel peer in %v; target delivery, downloads, and sustained transfer are unverified. Use -diag-echo for a bulk test.\n", time.Since(t1).Round(time.Millisecond))
 		st.Close()
 		return failed
 	}
@@ -212,8 +238,8 @@ func runDiag(cfg *config.ClientConfig) int {
 	st.Close()
 	if rerr != nil {
 		if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
-			fmt.Printf("tunnel check: stream to %s open and idle for 3s: OK (%v to open)\n", target, opened.Round(time.Millisecond))
-			return failed
+			fmt.Printf("tunnel check: stream to %s idle for 3s (%v to open); data delivery is inconclusive. Use -diag-echo for a verified transfer.\n", target, opened.Round(time.Millisecond))
+			return 1
 		}
 		fmt.Printf("tunnel check: stream to %s closed by server: %v (wrong password/keys, or target down)\n", target, rerr)
 		return 1

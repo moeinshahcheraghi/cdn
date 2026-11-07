@@ -14,6 +14,10 @@
   // Iran) drop the split ClientHello, causing handshake timeouts. firefox/safari
   // fit in one packet.
   "fingerprint": "firefox",
+  // Experimental Linux Ethernet/IPv4 raw injection; requires CAP_NET_RAW.
+  // This fake name is separate from the real sni/HTTP host above. It does
+  // not guarantee access through a whitelist. Omit to disable.
+  // "fake_sni": "chatgpt.com",
   // Split the ClientHello into small pieces so DPI cannot read the SNI from
   // one packet. For a network that filters by domain: e.g. from some Iranian
   // datacenters several .ir domains behind Cloudflare were reset or had their

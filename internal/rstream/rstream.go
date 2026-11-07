@@ -275,12 +275,14 @@ func (s *Stream) Detach() {
 
 func (s *Stream) dropCarrierLocked() {
 	if s.carrier != nil {
-		// Not under the lock: closing a carrier stuck on a dead connection can
-		// wait for its transport's long timeout, and the stream has somewhere
-		// better to be.
-		go s.carrier.Close()
+		old := s.carrier
 		s.carrier = nil
 		s.gen++ // invalidates loops
+		// smux.Close sends a FIN and can wait for a blocked carrier for up
+		// to 30 seconds. Invalidate it before closing, and never hold the
+		// stream state lock during network cleanup: readers, writers and a
+		// replacement carrier must remain able to make progress.
+		go old.Close()
 	}
 }
 

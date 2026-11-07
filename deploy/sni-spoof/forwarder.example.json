@@ -1,0 +1,14 @@
+{
+  "graceful_shutdown_sec": 0,
+  "listeners": [
+    {
+      "listen": "127.0.0.1:40443",
+      "connect": "CLOUDFLARE_IP:443",
+      "fake_sni": "chatgpt.com",
+      "conn_timeout_sec": 5,
+      "handshake_timeout_sec": 2,
+      "keepalive_time_sec": 11,
+      "keepalive_interval_sec": 2
+    }
+  ]
+}

@@ -48,10 +48,11 @@ const (
 
 // Conn is a net.Conn over one HTTP/2 connection to the server (or CDN).
 type Conn struct {
-	tls  net.Conn
-	cc   *http2.ClientConn
-	host string
-	base string // https://host/path/session
+	tls       net.Conn
+	cc        *http2.ClientConn
+	host      string
+	userAgent string
+	base      string // https://host/path/session
 
 	ctx    context.Context // ends with the Conn; aborts every request
 	cancel context.CancelFunc
@@ -65,7 +66,14 @@ type Conn struct {
 // Dial opens the tunnel over conn, a TLS connection that negotiated h2. It
 // returns once the server has answered the download request, so a success
 // means the whole path (CDN and origin) is up. ctx bounds only the setup.
-func Dial(ctx context.Context, conn net.Conn, host, path string) (*Conn, error) {
+func Dial(ctx context.Context, conn net.Conn, host, path string, agent ...string) (*Conn, error) {
+	ua := UserAgent
+	if len(agent) > 0 {
+		ua = agent[0]
+	}
+	if strings.ContainsAny(ua, "\r\n") {
+		return nil, fmt.Errorf("invalid User-Agent")
+	}
 	t := &http2.Transport{DisableCompression: true}
 	cc, err := t.NewClientConn(conn)
 	if err != nil {
@@ -80,7 +88,7 @@ func Dial(ctx context.Context, conn net.Conn, host, path string) (*Conn, error) 
 	}
 	life, cancel := context.WithCancel(context.Background())
 	c := &Conn{
-		tls: conn, cc: cc, host: host,
+		tls: conn, cc: cc, host: host, userAgent: ua,
 		base:   "https://" + host + strings.TrimSuffix(path, "/") + "/" + hex.EncodeToString(id[:]),
 		ctx:    life,
 		cancel: cancel,
@@ -125,7 +133,7 @@ func Dial(ctx context.Context, conn net.Conn, host, path string) (*Conn, error) 
 }
 
 func (c *Conn) headers(req *http.Request) {
-	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
 	req.Header.Set("Cache-Control", "no-cache")

@@ -104,6 +104,7 @@ type Backup struct {
 	Server        string              `json:"server"`
 	Servers       []string            `json:"servers"`
 	SNI           string              `json:"sni"`
+	FakeSNI       string              `json:"fake_sni"`
 	Fingerprint   string              `json:"fingerprint"`
 	Reality       RealityClientConfig `json:"reality"`
 	WS            WSClientConfig      `json:"ws"`
@@ -230,6 +231,7 @@ type ClientConfig struct {
 	Backups []Backup `json:"backups"`
 	// Fingerprint mimics a browser's TLS ClientHello: chrome|firefox|safari|ios|edge|random.
 	Fingerprint string `json:"fingerprint"`
+	FakeSNI     string `json:"fake_sni"`
 	// Fragment splits the ClientHello against SNI filtering; backups
 	// inherit it unless they set their own.
 	Fragment *FragmentConfig `json:"fragment"`

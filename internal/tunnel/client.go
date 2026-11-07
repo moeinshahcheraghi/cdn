@@ -198,7 +198,7 @@ func NewClient(c *config.ClientConfig) *Client {
 // as tier 0 and each backup as tier 1.
 func Endpoints(c *config.ClientConfig) []transport.Endpoint {
 	var eps []transport.Endpoint
-	add := func(tier int, server string, servers []string, sni, fp string, r config.RealityClientConfig, ws, h config.WSClientConfig, ech string, insecure bool, frag *config.FragmentConfig) {
+	add := func(tier int, server string, servers []string, sni, fp, fakeSNI string, r config.RealityClientConfig, ws, h config.WSClientConfig, ech string, insecure bool, frag *config.FragmentConfig) {
 		if len(servers) == 0 {
 			servers = []string{server}
 		}
@@ -209,7 +209,7 @@ func Endpoints(c *config.ClientConfig) []transport.Endpoint {
 			keys = transport.NewECH(list)
 		}
 		for _, srv := range servers {
-			ep := transport.Endpoint{Server: srv, SNI: sni, Fingerprint: fp, AllowInsecure: insecure, Tier: tier}
+			ep := transport.Endpoint{Server: srv, SNI: sni, FakeSNI: fakeSNI, Fingerprint: fp, AllowInsecure: insecure, Tier: tier}
 			if r.PublicKey != "" {
 				ep.Reality = &transport.RealityClient{PublicKey: r.PublicKey, ShortID: r.ShortID}
 			}
@@ -224,9 +224,9 @@ func Endpoints(c *config.ClientConfig) []transport.Endpoint {
 			eps = append(eps, ep)
 		}
 	}
-	add(0, c.Server, c.Servers, c.SNI, c.Fingerprint, c.Reality, c.WS, c.HTTP, c.ECH, c.AllowInsecure, c.Fragment)
+	add(0, c.Server, c.Servers, c.SNI, c.Fingerprint, c.FakeSNI, c.Reality, c.WS, c.HTTP, c.ECH, c.AllowInsecure, c.Fragment)
 	for _, b := range c.Backups {
-		add(1, b.Server, b.Servers, b.SNI, b.Fingerprint, b.Reality, b.WS, b.HTTP, b.ECH, b.AllowInsecure, b.Fragment)
+		add(1, b.Server, b.Servers, b.SNI, b.Fingerprint, b.FakeSNI, b.Reality, b.WS, b.HTTP, b.ECH, b.AllowInsecure, b.Fragment)
 	}
 	return eps
 }
